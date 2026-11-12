@@ -23,12 +23,14 @@ import sqlite3
 import tempfile
 import textwrap
 import time
+import urllib.error
+import urllib.request
 import zipfile
 import zlib
 from collections import Counter, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -107,6 +109,20 @@ REF_REWARD_TEXT = f"{REF_REWARD_PERCENT}%" if REF_REWARD_PERCENT > 0 else f"{REF
 # за доплату SMALL_ORDER_FEE ₽ (на любую сумму). MIN_ORDER=0 — без минимума.
 MIN_ORDER = int(os.getenv("MIN_ORDER", "100"))
 SMALL_ORDER_FEE = int(os.getenv("SMALL_ORDER_FEE", "20"))
+# Будильник о заказе: «экстренное» уведомление Pushover на телефон продавца. Пробивает «Не беспокоить»,
+# повторяется каждые ALARM_RETRY сек (минимум 30), пока не нажмёте «принято», но не дольше ALARM_EXPIRE сек
+# (максимум 10800). Пустые PUSHOVER_TOKEN / PUSHOVER_USER — будильник выключен.
+PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "").strip()  # токен приложения (pushover.net/apps/build)
+PUSHOVER_USER = os.getenv("PUSHOVER_USER", "").strip()  # ваш User Key (на главной pushover.net)
+ALARM_RETRY = max(int(os.getenv("ALARM_RETRY", "30")), 30)
+ALARM_EXPIRE = min(max(int(os.getenv("ALARM_EXPIRE", "1800")), 60), 10800)
+ALARM_SOUND = os.getenv("ALARM_SOUND", "siren")
+# Часы, когда будильник работает (по TIMEZONE). Пусто — всегда. Например ALARM_FROM=23, ALARM_TO=7.
+ALARM_FROM = int(os.getenv("ALARM_FROM") or -1)
+ALARM_TO = int(os.getenv("ALARM_TO") or -1)
+# Заказ переводом: будить, когда клиент нажал «Я оплатил(а)» (paid) или сразу при заказе (order).
+# Наличные заказы будят всегда сразу.
+ALARM_TRANSFER_WHEN = os.getenv("ALARM_TRANSFER_WHEN", "paid").strip().lower()
 SUPPORT_MIN_GAP = int(os.getenv("SUPPORT_MIN_GAP", "10"))  # пауза между сообщениями в поддержку, сек
 
 # Стартовый ассортимент для НОВОЙ базы: (название, цена, остаток, описание, закупка).
@@ -1969,6 +1985,79 @@ async def notify_seller(text, kb=None):
         )
 
 
+# ── Будильник (Pushover) ──
+_bg_tasks = set()
+
+
+def fire_and_forget(coro):
+    """Запустить корутину в фоне, не задерживая ответ боту."""
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
+def alarm_configured():
+    return bool(PUSHOVER_TOKEN and PUSHOVER_USER)
+
+
+def alarm_active(now=None):
+    """Включён ли будильник сейчас (настроен и попадает в часы ALARM_FROM–ALARM_TO)."""
+    if not alarm_configured():
+        return False
+    if ALARM_FROM < 0 or ALARM_TO < 0 or ALARM_FROM == ALARM_TO:
+        return True
+    h = (now or datetime.now(ZoneInfo(TZ))).hour
+    if ALARM_FROM < ALARM_TO:
+        return ALARM_FROM <= h < ALARM_TO
+    return h >= ALARM_FROM or h < ALARM_TO  # окно через полночь
+
+
+def _pushover_call(path, data):
+    req = urllib.request.Request(
+        "https://api.pushover.net/1/" + path, data=urlencode(data).encode("utf-8"), method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Pushover ответил {e.code}: {e.read().decode('utf-8', 'replace')[:200]}") from None
+
+
+async def alarm_send(oid, title, message, retry, expire):
+    data = {
+        "token": PUSHOVER_TOKEN, "user": PUSHOVER_USER, "title": title[:250], "message": message[:1000],
+        "priority": 2, "retry": retry, "expire": expire, "sound": ALARM_SOUND,
+        "tags": f"order{oid}",  # по тегу сигнал можно остановить, не храня номер квитанции
+    }
+    return await asyncio.to_thread(_pushover_call, "messages.json", data)
+
+
+async def alarm_new_order(o):
+    """Поднять продавца будильником из-за заказа o (строка из orders)."""
+    if not alarm_active():
+        return
+    items = json.loads(o["items_json"])
+    names = ", ".join(f"{i['name']} ×{i['qty']}" for i in items)
+    msg = (
+        f"{names}\nОплата: {PAY_LABELS.get(o['payment'], o['payment'])}\n"
+        "Откройте Telegram → бот продавца → «Собран»."
+    )
+    try:
+        await alarm_send(o["id"], f"Заказ #{o['id']} — {o['total']} ₽", msg, ALARM_RETRY, ALARM_EXPIRE)
+    except Exception:
+        logging.exception("Pushover: не удалось отправить будильник")
+
+
+async def alarm_cancel(oid):
+    """Остановить повторы будильника по заказу (продавец отреагировал или заказ отменился)."""
+    if not alarm_configured():
+        return
+    try:
+        await asyncio.to_thread(_pushover_call, f"receipts/cancel_by_tag/order{oid}.json", {"token": PUSHOVER_TOKEN})
+    except Exception:
+        logging.warning("Pushover: не удалось остановить будильник по заказу #%s", oid)
+
+
 @customer_router.callback_query(F.data.startswith("pay:"))
 async def c_pay(cb: CallbackQuery):
     payment = cb.data.split(":")[1]
@@ -2015,6 +2104,8 @@ async def c_pay(cb: CallbackQuery):
     await cb.answer()
 
     await notify_seller(admin_order_text(o), admin_order_kb(o))
+    if payment == "cash" or ALARM_TRANSFER_WHEN == "order":
+        fire_and_forget(alarm_new_order(o))
     for name, sku, stock in low:
         await notify_seller(
             f"⚠️ <b>{'Закончился' if stock <= 0 else 'Заканчивается'}:</b> {html.escape(name)} "
@@ -2051,6 +2142,8 @@ async def c_paid(cb: CallbackQuery):
     )
     o = get_order(oid)
     await notify_seller("🔔 <b>Клиент сообщил об оплате</b>\n\n" + admin_order_text(o), admin_order_kb(o))
+    if ALARM_TRANSFER_WHEN != "order":
+        fire_and_forget(alarm_new_order(o))
 
 
 # ── Предложения покупателей ──
@@ -2625,6 +2718,7 @@ SELLER_HELP = (
     "Заказы приходят сюда. Оплату переводом подтверждаете кнопкой «Оплата получена».\n\n"
     "/orders — активные заказы (у каждого есть кнопка «🧾 Чек»)\n"
     "/receipt [№] — чек по заказу (без номера — последнего)\n"
+    "/alarmtest — проверить будильник (звонок на телефон при заказе)\n"
     "/stats — статистика (ночь / 7 / 30 дней / всё время), с прибылью\n"
     "/suggestions — предложения покупателей\n"
     "/stock — товары, артикулы, остатки\n"
@@ -2758,6 +2852,7 @@ async def s_order_action(cb: CallbackQuery, state: FSMContext):
     if not o:
         await cb.answer("Заказ не найден", show_alert=True)
         return
+    fire_and_forget(alarm_cancel(oid))  # продавец проснулся и занялся заказом — гасим будильник
     if o["status"] not in ACTIVE_STATUSES:
         await cb.answer("Заказ уже обработан", show_alert=True)
         return
@@ -2819,6 +2914,25 @@ async def s_order_action(cb: CallbackQuery, state: FSMContext):
                 f"<b>−{REF_REWARD_TEXT}</b> на любой заказ (/promo {code}).",
             )
             await cb.message.answer(f"🎁 «Приведи друга»: клиент {rid} получил промокод {code}.")
+
+
+@seller_router.message(Command("alarmtest"))
+async def s_alarmtest(m: Message):
+    if not alarm_configured():
+        await m.answer(
+            "🔔 Будильник не настроен.\nВ .env нужны PUSHOVER_TOKEN и PUSHOVER_USER "
+            "(приложение Pushover на iPhone + ключи с pushover.net), затем перезапустите бота."
+        )
+        return
+    try:
+        await alarm_send(0, "Проверка будильника", "Если вы это слышите — всё настроено. Нажмите «Acknowledge».", 30, 60)
+    except Exception as e:
+        await m.answer(f"❌ Не получилось отправить: {html.escape(str(e))[:300]}")
+        return
+    await m.answer(
+        "🔔 Тестовый сигнал отправлен — на iPhone должен зазвучать будильник. "
+        "Если тишина, проверьте настройки из инструкции (Фокусирование, «Критические уведомления» в Pushover)."
+    )
 
 
 @seller_router.callback_query(F.data.startswith("rcpt:"))
@@ -3964,6 +4078,7 @@ CUSTOMER_COMMANDS = [
 SELLER_COMMANDS = [
     ("orders", "📋 Активные заказы"),
     ("receipt", "🧾 Чек по заказу"),
+    ("alarmtest", "🔔 Проверить будильник"),
     ("stats", "📈 Статистика"),
     ("stock", "📦 Склад и остатки"),
     ("suggestions", "💡 Предложения покупателей"),
@@ -4112,6 +4227,7 @@ async def reserve_watcher():
                     b.as_markup(),
                 )
             for o in expired:
+                fire_and_forget(alarm_cancel(o["id"]))
                 await tell_customer(
                     o["user_id"],
                     f"⏰ Заказ #{o['id']} отменён: оплата не поступила за {RESERVE_MINUTES} мин. "
