@@ -95,6 +95,18 @@ REF_FRIEND_AMOUNT = int(os.getenv("REF_FRIEND_AMOUNT", "30"))
 REF_REWARD_AMOUNT = int(os.getenv("REF_REWARD_AMOUNT", "30"))
 REF_MIN_TOTAL = int(os.getenv("REF_MIN_TOTAL", "100"))  # награда — когда заказ друга выдан и не меньше этой суммы
 REF_MAX_REWARDS = int(os.getenv("REF_MAX_REWARDS", "5"))  # максимум наград одному человеку (0 — без лимита)
+# «Приведи друга» в процентах: скидка другу и награда пригласившему, % от суммы заказа.
+# Если процент 0 — берётся фиксированная сумма REF_FRIEND_AMOUNT / REF_REWARD_AMOUNT.
+REF_FRIEND_PERCENT = int(os.getenv("REF_FRIEND_PERCENT", "10"))
+REF_REWARD_PERCENT = int(os.getenv("REF_REWARD_PERCENT", "10"))
+REF_FRIEND_ON = REF_FRIEND_PERCENT > 0 or REF_FRIEND_AMOUNT > 0
+REF_REWARD_ON = REF_REWARD_PERCENT > 0 or REF_REWARD_AMOUNT > 0
+REF_FRIEND_TEXT = f"{REF_FRIEND_PERCENT}%" if REF_FRIEND_PERCENT > 0 else f"{REF_FRIEND_AMOUNT} ₽"
+REF_REWARD_TEXT = f"{REF_REWARD_PERCENT}%" if REF_REWARD_PERCENT > 0 else f"{REF_REWARD_AMOUNT} ₽"
+# Минимальный заказ: если товаров меньше чем на MIN_ORDER ₽, заказ всё равно можно оформить —
+# за доплату SMALL_ORDER_FEE ₽ (на любую сумму). MIN_ORDER=0 — без минимума.
+MIN_ORDER = int(os.getenv("MIN_ORDER", "100"))
+SMALL_ORDER_FEE = int(os.getenv("SMALL_ORDER_FEE", "20"))
 SUPPORT_MIN_GAP = int(os.getenv("SUPPORT_MIN_GAP", "10"))  # пауза между сообщениями в поддержку, сек
 
 # Стартовый ассортимент для НОВОЙ базы: (название, цена, остаток, описание, закупка).
@@ -353,6 +365,7 @@ def init_db():
         ensure_column(c, "products", "sale_price", "INTEGER")  # цена по акции (NULL — нет акции)
         ensure_column(c, "orders", "promo_code", "TEXT")
         ensure_column(c, "orders", "discount", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(c, "orders", "fee", "INTEGER NOT NULL DEFAULT 0")  # доплата за малый заказ
         # reminded: 0 — нет, 1 — напомнили об оплате, 2 — продавец сказал «оплаты нет», не отменять само
         ensure_column(c, "orders", "reminded", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(c, "promocodes", "owner_id", "INTEGER")  # личный промокод (приведи друга)
@@ -566,8 +579,15 @@ def promo_discount(c, code, user_id, subtotal):
     return d, None
 
 
+def small_order_fee(subtotal):
+    """Доплата за заказ меньше MIN_ORDER (считается от суммы товаров ДО промокода)."""
+    if MIN_ORDER > 0 and SMALL_ORDER_FEE > 0 and 0 < subtotal < MIN_ORDER:
+        return SMALL_ORDER_FEE
+    return 0
+
+
 def cart_totals(user_id):
-    """(товары, сумма, скидка, итого, промокод, ошибка_промокода)."""
+    """(товары, сумма, скидка, итого, промокод, ошибка_промокода). Итого уже включает доплату за малый заказ."""
     items = cart_items(user_id)
     subtotal = sum(eff_price(i["price"]) * i["qty"] for i in items)
     code = err = None
@@ -580,7 +600,7 @@ def cart_totals(user_id):
                 c.execute("DELETE FROM cart_promos WHERE user_id=?", (user_id,))
             else:
                 code, discount = row["code"], d
-    return items, subtotal, discount, subtotal - discount, code, err
+    return items, subtotal, discount, subtotal - discount + small_order_fee(subtotal), code, err
 
 
 # ── Поиск ──
@@ -704,13 +724,14 @@ def place_order(user, payment):
                 c.execute("DELETE FROM cart_promos WHERE user_id=?", (user.id,))
                 return None, f"Промокод больше не действует: {perr} Проверьте корзину и оформите заказ ещё раз."
             discount, code = d, prow["code"]
-        total = subtotal - discount
+        fee = small_order_fee(subtotal)
+        total = subtotal - discount + fee
         for i in items:
             c.execute("UPDATE products SET stock = stock - ? WHERE id=?", (i["qty"], i["id"]))
         cur = c.execute(
             """INSERT INTO orders(user_id, username, full_name, room, payment, total,
-                                  items_json, created_at, promo_code, discount)
-               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                                  items_json, created_at, promo_code, discount, fee)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 user.id,
                 user.username,
@@ -722,6 +743,7 @@ def place_order(user, payment):
                 now.strftime("%Y-%m-%d %H:%M:%S"),
                 code,
                 discount,
+                fee,
             ),
         )
         if code:
@@ -1010,8 +1032,8 @@ def users_csv_bytes():
 
 
 # ── Приведи друга ──
-def make_personal_promo(user_id, amount):
-    """Одноразовый промокод на amount ₽, который сможет применить только user_id."""
+def make_personal_promo(user_id, amount=0, percent=0):
+    """Одноразовый промокод (percent % — приоритетнее, иначе amount ₽), который сможет применить только user_id."""
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     with db() as c:
         while True:
@@ -1020,7 +1042,7 @@ def make_personal_promo(user_id, amount):
                 break
         c.execute(
             "INSERT INTO promocodes(code, percent, amount, max_uses, used, owner_id) VALUES(?,?,?,?,?,?)",
-            (code, 0, amount, 1, 0, user_id),
+            (code, percent, 0 if percent else amount, 1, 0, user_id),
         )
     return code
 
@@ -1028,13 +1050,13 @@ def make_personal_promo(user_id, amount):
 def referral_reward(o):
     """Вызывать, когда заказ o выдан. Если это первый зачётный заказ приглашённого —
     создаёт награду пригласившему и возвращает (referrer_id, промокод), иначе None."""
-    if REF_REWARD_AMOUNT <= 0:
+    if not REF_REWARD_ON:
         return None
     with db() as c:
         u = c.execute(
             "SELECT referrer_id, ref_rewarded FROM users WHERE user_id=?", (o["user_id"],)
         ).fetchone()
-        if not u or not u["referrer_id"] or u["ref_rewarded"] or o["total"] < REF_MIN_TOTAL:
+        if not u or not u["referrer_id"] or u["ref_rewarded"] or o["total"] - (o["fee"] or 0) < REF_MIN_TOTAL:
             return None
         if REF_MAX_REWARDS > 0:
             n = c.execute(
@@ -1044,7 +1066,7 @@ def referral_reward(o):
                 return None
         c.execute("UPDATE users SET ref_rewarded=1 WHERE user_id=?", (o["user_id"],))
         rid = u["referrer_id"]
-    return rid, make_personal_promo(rid, REF_REWARD_AMOUNT)
+    return rid, make_personal_promo(rid, REF_REWARD_AMOUNT, REF_REWARD_PERCENT)
 
 
 def ref_link(user_id):
@@ -1053,7 +1075,7 @@ def ref_link(user_id):
 
 
 def friend_card(user_id):
-    if REF_FRIEND_AMOUNT <= 0 and REF_REWARD_AMOUNT <= 0:
+    if not REF_FRIEND_ON and not REF_REWARD_ON:
         return "🎁 Программа «Приведи друга» сейчас отключена.", None
     with db() as c:
         invited = c.execute("SELECT COUNT(*) FROM users WHERE referrer_id=?", (user_id,)).fetchone()[0]
@@ -1061,16 +1083,16 @@ def friend_card(user_id):
             "SELECT COUNT(*) FROM users WHERE referrer_id=? AND ref_rewarded=1", (user_id,)
         ).fetchone()[0]
         codes = c.execute(
-            "SELECT code, amount FROM promocodes WHERE owner_id=? AND (max_uses IS NULL OR used < max_uses) "
+            "SELECT code, amount, percent FROM promocodes WHERE owner_id=? AND (max_uses IS NULL OR used < max_uses) "
             "ORDER BY rowid", (user_id,),
         ).fetchall()
     link = ref_link(user_id)
     out = ["🎁 <b>Приведи друга</b>", ""]
-    if REF_FRIEND_AMOUNT > 0:
-        out.append(f"Друг, который придёт по вашей ссылке, получит <b>−{REF_FRIEND_AMOUNT} ₽</b> на первый заказ.")
-    if REF_REWARD_AMOUNT > 0:
+    if REF_FRIEND_ON:
+        out.append(f"Друг, который придёт по вашей ссылке, получит <b>−{REF_FRIEND_TEXT}</b> на первый заказ.")
+    if REF_REWARD_ON:
         out.append(
-            f"А вы — <b>−{REF_REWARD_AMOUNT} ₽</b> на заказ, когда его первый заказ "
+            f"А вы — <b>−{REF_REWARD_TEXT}</b> на заказ, когда его первый заказ "
             f"(от {REF_MIN_TOTAL} ₽) будет выдан."
         )
     out.append("")
@@ -1079,7 +1101,7 @@ def friend_card(user_id):
     if codes:
         out.append("\n🎟 <b>Ваши промокоды</b> (одноразовые, личные):")
         for r in codes:
-            out.append(f"<code>{r['code']}</code> — −{r['amount']} ₽")
+            out.append(f"<code>{r['code']}</code> — −" + (f"{r['percent']}%" if r["percent"] else f"{r['amount']} ₽"))
         out.append("Применить: «🏷 Ввести промокод» в корзине или /promo КОД")
     kb = None
     if link:
@@ -1396,8 +1418,9 @@ def compute_stats(start=None, end=None):
             if o["status"] == "done":
                 profit += gain
 
-    for o in done:  # промокод уменьшает выручку, а значит и прибыль
+    for o in done:  # промокод уменьшает выручку (и прибыль), доплата за малый заказ — наоборот
         profit -= o["discount"] or 0
+        profit += o["fee"] or 0
 
     buyers = Counter(o["user_id"] for o in live)
     unpaid = [o for o in active if o["payment"] == "transfer" and o["pay_status"] != "paid"]
@@ -1638,9 +1661,19 @@ def build_cart(user_id):
     kb.button(text="✅ Оформить заказ", callback_data="checkout")
     kb.adjust(*([2] * len(items)), 2, 1, 1)
     text = "🛒 <b>Ваша корзина</b>\n\n" + "\n".join(lines)
+    fee = small_order_fee(subtotal)
+    if discount or fee:
+        text += f"\n\nСумма: {subtotal} ₽"
     if discount:
-        text += f"\n\nСумма: {subtotal} ₽\n🏷 Промокод {html.escape(code)}: −{discount} ₽"
+        text += f"\n🏷 Промокод {html.escape(code)}: −{discount} ₽"
+    if fee:
+        text += f"\n📦 Доплата за малый заказ: +{fee} ₽"
     text += f"\n\n<b>Итого: {total} ₽</b>"
+    if fee:
+        text += (
+            f"\nℹ️ Минимальный заказ — {MIN_ORDER} ₽. Меньше тоже можно, но с доплатой {fee} ₽. "
+            f"Добавьте товаров ещё на {MIN_ORDER - subtotal} ₽ — и доплата не понадобится."
+        )
     if perr:
         text += f"\n⚠️ Промокод снят: {html.escape(perr)}"
     if surcharge_active():
@@ -1919,6 +1952,8 @@ async def c_checkout(cb: CallbackQuery):
     await cb.message.answer(
         f"Сумма заказа: <b>{total} ₽</b>"
         + (f" (промокод {html.escape(code)}: −{discount} ₽)" if discount else "")
+        + (f"\n📦 Включая доплату за малый заказ (меньше {MIN_ORDER} ₽): +{small_order_fee(subtotal)} ₽"
+           if small_order_fee(subtotal) else "")
         + "\nКак будете платить?",
         reply_markup=kb.as_markup(),
     )
@@ -1951,10 +1986,14 @@ async def c_pay(cb: CallbackQuery):
         await cb.answer()
         return
     oid, items, total, discount, code, low = result
+    o = get_order(oid)
+    fee = o["fee"] or 0
 
     msg = f"✅ <b>Заказ #{oid} принят!</b>\nСумма: <b>{total} ₽</b>."
     if discount:
         msg += f"\n🏷 Промокод {html.escape(code)}: −{discount} ₽"
+    if fee:
+        msg += f"\n📦 В сумму входит доплата за малый заказ (меньше {MIN_ORDER} ₽): +{fee} ₽"
     kb = None
     if payment == "transfer":
         msg += (
@@ -1975,7 +2014,6 @@ async def c_pay(cb: CallbackQuery):
     await cb.message.edit_text(msg, reply_markup=kb)
     await cb.answer()
 
-    o = get_order(oid)
     await notify_seller(admin_order_text(o), admin_order_kb(o))
     for name, sku, stock in low:
         await notify_seller(
@@ -2185,19 +2223,19 @@ async def welcome_referred(user):
         u = c.execute("SELECT referrer_id FROM users WHERE user_id=?", (user.id,)).fetchone()
     if not u or not u["referrer_id"]:
         return
-    if REF_FRIEND_AMOUNT > 0:
-        code = make_personal_promo(user.id, REF_FRIEND_AMOUNT)
+    if REF_FRIEND_ON:
+        code = make_personal_promo(user.id, REF_FRIEND_AMOUNT, REF_FRIEND_PERCENT)
         await tell_customer(
             user.id,
             f"🎁 Вас пригласил друг! Промокод на первый заказ: <code>{code}</code> — "
-            f"<b>−{REF_FRIEND_AMOUNT} ₽</b>.\nПримените его в корзине («🏷 Ввести промокод») или командой "
+            f"<b>−{REF_FRIEND_TEXT}</b>.\nПримените его в корзине («🏷 Ввести промокод») или командой "
             f"<code>/promo {code}</code>",
         )
-    if REF_REWARD_AMOUNT > 0:
+    if REF_REWARD_ON:
         await tell_customer(
             u["referrer_id"],
             f"👋 По вашей ссылке в магазин пришёл(а) {html.escape(user.full_name)}. Как только первый заказ "
-            f"друга (от {REF_MIN_TOTAL} ₽) будет выдан, вы получите промокод на −{REF_REWARD_AMOUNT} ₽.",
+            f"друга (от {REF_MIN_TOTAL} ₽) будет выдан, вы получите промокод на −{REF_REWARD_TEXT}.",
         )
 
 
@@ -2445,6 +2483,7 @@ def admin_order_text(o):
         f"Сумма: <b>{o['total']} ₽</b>"
         + (f" 🌙 (ночной тариф +{SURCHARGE_PERCENT}%)" if surcharged else "")
         + (f"\n🏷 Промокод {html.escape(o['promo_code'])}: −{o['discount']} ₽" if o["promo_code"] else "")
+        + (f"\n📦 Доплата за малый заказ: +{o['fee']} ₽" if o["fee"] else "")
         + "\n"
         f"Оплата: {pay_line(o)}\n"
         f"{room_line}\n"
@@ -2530,10 +2569,15 @@ def receipt_body(o):
         else:
             cost_sum += cost * i["qty"]
     out.append(sep)
-    if o["promo_code"] and (o["discount"] or 0):
+    has_promo = bool(o["promo_code"] and (o["discount"] or 0))
+    fee = o["fee"] or 0
+    if has_promo or fee:
         out.append(_receipt_row("Сумма", rub(subtotal)))
+    if has_promo:
         out += _receipt_wrap(f"Промокод {o['promo_code']}", "  ")
         out.append(_receipt_row("  скидка", "−" + rub(o["discount"])))
+    if fee:
+        out.append(_receipt_row(f"Доплата (заказ < {MIN_ORDER} ₽)", "+" + rub(fee)))
     out.append(_receipt_row("ИТОГО", rub(o["total"])))
     if any(i.get("base_price", i["price"]) != i["price"] for i in items):
         out.append(f"(ночной тариф +{SURCHARGE_PERCENT}% в ценах)")
@@ -2772,7 +2816,7 @@ async def s_order_action(cb: CallbackQuery, state: FSMContext):
             await tell_customer(
                 rid,
                 f"🎉 Ваш друг сделал первый заказ! Подарок вам: промокод <code>{code}</code> — "
-                f"<b>−{REF_REWARD_AMOUNT} ₽</b> на любой заказ (/promo {code}).",
+                f"<b>−{REF_REWARD_TEXT}</b> на любой заказ (/promo {code}).",
             )
             await cb.message.answer(f"🎁 «Приведи друга»: клиент {rid} получил промокод {code}.")
 
