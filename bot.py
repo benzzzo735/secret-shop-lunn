@@ -71,18 +71,8 @@ CLOSE_HOUR = int(os.getenv("CLOSE_HOUR", "6"))
 SURCHARGE_PERCENT = int(os.getenv("SURCHARGE_PERCENT", "30"))
 SURCHARGE_FROM = int(os.getenv("SURCHARGE_FROM", "2"))
 SURCHARGE_TO = int(os.getenv("SURCHARGE_TO", "6"))
-# На хостингах данные переживают обновления только в особой папке (/data у FadeHost, /app/data у Bothost).
-# Если она есть — бот сам кладёт туда базу и фото, даже если переменные DB_PATH/PHOTOS_DIR не заданы.
-def _default_data_dir():
-    for d in ("/data", "/app/data"):
-        if os.path.isdir(d) and os.access(d, os.W_OK):
-            return d
-    return BASE_DIR
-
-
-DATA_DIR = _default_data_dir()
-PHOTOS_DIR = os.getenv("PHOTOS_DIR", os.path.join(DATA_DIR, "photos"))
-DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "shop.db"))
+PHOTOS_DIR = os.getenv("PHOTOS_DIR", os.path.join(BASE_DIR, "photos"))
+DB_PATH = os.getenv("DB_PATH", os.path.join(BASE_DIR, "shop.db"))
 # Режим работы: пусто = круглосуточно. Можно менять прямо из бота продавца: /hours 22:00 06:00
 WORK_FROM = os.getenv("WORK_FROM", "")
 WORK_TO = os.getenv("WORK_TO", "")
@@ -4211,8 +4201,6 @@ async def main():
     if BOT_TOKEN == SELLER_BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN и SELLER_BOT_TOKEN должны быть токенами РАЗНЫХ ботов.")
     lock = acquire_single_instance_lock()  # noqa: F841 (держим сокет открытым)
-    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)  # на хостинге: /app/data
-    os.makedirs(PHOTOS_DIR, exist_ok=True)
     init_db()
     logging.info("База данных: %s", DB_PATH)
 
