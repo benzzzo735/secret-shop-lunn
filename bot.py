@@ -668,6 +668,32 @@ def search_products(query):
     return []
 
 
+AUTO_SKU_RE = re.compile(r"^A\d+(-\d+)?$", re.I)
+
+
+def resequence_skus(c):
+    """Выстроить автоматические артикулы (A001, A002…) по порядку id без пропусков.
+    Свои артикулы (заданные через /setsku или импорт, не вида A123) не трогаем и не занимаем их номера.
+    Возвращает [(id, старый, новый)] только по изменившимся."""
+    rows = c.execute("SELECT id, sku FROM products ORDER BY id").fetchall()
+    custom = {(r["sku"] or "").lower() for r in rows if r["sku"] and not AUTO_SKU_RE.match(r["sku"])}
+    changes, n = [], 0
+    for r in rows:
+        if r["sku"] and not AUTO_SKU_RE.match(r["sku"]):
+            continue
+        n += 1
+        while f"a{n:03d}" in custom:
+            n += 1
+        new = f"A{n:03d}"
+        if r["sku"] != new:
+            changes.append((r["id"], r["sku"], new))
+    for pid, _, _ in changes:  # сначала освобождаем артикулы, чтобы при переименовании не было пересечений
+        c.execute("UPDATE products SET sku=? WHERE id=?", (f"~tmp{pid}", pid))
+    for pid, _, new in changes:
+        c.execute("UPDATE products SET sku=? WHERE id=?", (new, pid))
+    return changes
+
+
 def find_pid(token):
     """id товара по числовому id или артикулу."""
     with db() as c:
@@ -2752,7 +2778,8 @@ SELLER_HELP = (
     "/setcat id категория  («-» чтобы убрать)\n"
     "/rename id название\n"
     "/add Название | цена | остаток | описание | категория\n"
-    "/hide id и /show id — скрыть/показать товар в каталоге\n\n"
+    "/hide id и /show id — скрыть/показать товар в каталоге\n"
+    "/del id — удалить товар из базы (артикулы после этого выстроятся по порядку), /resku — выстроить артикулы без удаления\n\n"
     "🔥 <b>Акции и промокоды</b>\n"
     "/sale id цена — акционная цена (или /sale id -20%, /sale id - чтобы снять)\n"
     "/newpromo КОД 10% [лимит] или /newpromo КОД 50 [лимит] — создать промокод\n"
@@ -3170,6 +3197,87 @@ async def s_add(m: Message):
         f"Добавлено ✅ id {cur.lastrowid}, артикул <code>{html.escape(sku)}</code>: "
         f"{html.escape(f[0])}"
     )
+
+
+def _sku_changes_text(changes, limit=15):
+    if not changes:
+        return "Артикулы уже идут по порядку."
+    lines = [f"{old or '—'} → <b>{new}</b>" for _, old, new in changes[:limit]]
+    if len(changes) > limit:
+        lines.append(f"…и ещё {len(changes) - limit}")
+    return "Новые артикулы:\n" + "\n".join(lines)
+
+
+@seller_router.message(Command("del", "delete"))
+async def s_del(m: Message):
+    parts = m.text.split()
+    if len(parts) != 2:
+        await m.answer(
+            "Формат: /del id (или артикул) — удалить товар из базы навсегда.\n"
+            "Если нужно только убрать из каталога, лучше /hide id.\n"
+            "После удаления артикулы выстроятся по порядку (A001, A002…)."
+        )
+        return
+    pid = find_pid(parts[1])
+    if pid is None:
+        await m.answer("Нет товара с таким id или артикулом")
+        return
+    with db() as c:
+        p = c.execute("SELECT name, sku, stock FROM products WHERE id=?", (pid,)).fetchone()
+        active = 0
+        for o in c.execute("SELECT items_json FROM orders WHERE status IN ('new','ready')"):
+            if any(i.get("id") == pid for i in json.loads(o["items_json"])):
+                active += 1
+        in_carts = c.execute("SELECT COUNT(*) FROM carts WHERE product_id=?", (pid,)).fetchone()[0]
+    text = (
+        f"🗑 Удалить <b>{html.escape(p['name'])}</b> ({html.escape(p['sku'] or str(pid))}, остаток {p['stock']} шт.)?\n"
+        "Товар исчезнет из каталога, корзин, подписок и промокодов. Старые заказы останутся как есть."
+    )
+    if active:
+        text += (
+            f"\n⚠️ Он есть в незавершённых заказах: {active}. Они сохранятся, но при отмене такого заказа "
+            "остаток не вернётся — товара уже не будет."
+        )
+    if in_carts:
+        text += f"\nСейчас лежит в корзинах: {in_carts}."
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗑 Да, удалить", callback_data=f"del:ok:{pid}")
+    kb.button(text="Отмена", callback_data="del:no")
+    kb.adjust(2)
+    await m.answer(text, reply_markup=kb.as_markup())
+
+
+@seller_router.callback_query(F.data.startswith("del:"))
+async def s_del_cb(cb: CallbackQuery):
+    parts = cb.data.split(":")
+    if parts[1] == "no":
+        await cb.message.edit_text("Удаление отменено.")
+        await cb.answer()
+        return
+    pid = int(parts[2])
+    with db() as c:
+        p = c.execute("SELECT name FROM products WHERE id=?", (pid,)).fetchone()
+        if not p:
+            await cb.message.edit_text("Этого товара уже нет.")
+            await cb.answer()
+            return
+        c.execute("DELETE FROM carts WHERE product_id=?", (pid,))
+        c.execute("DELETE FROM stock_subs WHERE product_id=?", (pid,))
+        c.execute("DELETE FROM promo_prices WHERE product_id=?", (pid,))
+        c.execute("DELETE FROM products WHERE id=?", (pid,))
+        changes = resequence_skus(c)
+    await cb.message.edit_text(
+        f"🗑 Удалён: {html.escape(p['name'])}\n\n" + _sku_changes_text(changes)
+    )
+    await cb.answer("Удалено")
+
+
+@seller_router.message(Command("resku"))
+async def s_resku(m: Message):
+    """Выстроить артикулы по порядку без удаления товаров."""
+    with db() as c:
+        changes = resequence_skus(c)
+    await m.answer("🔢 " + _sku_changes_text(changes))
 
 
 @seller_router.message(Command("hide", "show"))
