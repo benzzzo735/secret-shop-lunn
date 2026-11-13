@@ -310,6 +310,13 @@ def init_db():
                 max_uses INTEGER,
                 used INTEGER NOT NULL DEFAULT 0
             );
+            -- особые цены промокода: если у кода есть строки здесь, он не режет сумму, а ставит эти цены
+            CREATE TABLE IF NOT EXISTS promo_prices(
+                code TEXT NOT NULL,
+                product_id INTEGER NOT NULL,
+                price INTEGER NOT NULL,
+                PRIMARY KEY(code, product_id)
+            );
             CREATE TABLE IF NOT EXISTS promo_uses(
                 code TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
@@ -574,8 +581,9 @@ def schedule_text():
 PROMO_RE = re.compile(r"^[A-Za-z0-9_-]{2,20}$")
 
 
-def promo_discount(c, code, user_id, subtotal):
-    """(скидка, None) или (None, текст_ошибки). Код сравнивается в верхнем регистре."""
+def promo_discount(c, code, user_id, subtotal, lines=None):
+    """(скидка, None) или (None, текст_ошибки). Код сравнивается в верхнем регистре.
+    lines — [(id товара, цена за шт. сейчас, кол-во)]: нужны для промокодов с особыми ценами."""
     code = (code or "").strip().upper()
     p = c.execute("SELECT * FROM promocodes WHERE code=?", (code,)).fetchone()
     if not p:
@@ -588,7 +596,15 @@ def promo_discount(c, code, user_id, subtotal):
         "SELECT 1 FROM promo_uses WHERE code=? AND user_id=?", (code, user_id)
     ).fetchone():
         return None, "Вы уже использовали этот промокод."
-    d = (subtotal * p["percent"] + 50) // 100 if p["percent"] else p["amount"]
+    special = {r["product_id"]: r["price"] for r in c.execute(
+        "SELECT product_id, price FROM promo_prices WHERE code=?", (code,))}
+    if special:
+        # особые цены: скидка = разница между текущей ценой и ценой по промокоду (только если она ниже)
+        d = sum(max(price - special[pid], 0) * qty for pid, price, qty in (lines or []) if pid in special)
+        if d <= 0:
+            return None, "В корзине нет товаров, на которые действует этот промокод."
+    else:
+        d = (subtotal * p["percent"] + 50) // 100 if p["percent"] else p["amount"]
     d = min(d, max(subtotal - 1, 0))  # заказ не может стать бесплатным
     if d <= 0:
         return None, "Скидка не применима к этой сумме."
@@ -611,7 +627,8 @@ def cart_totals(user_id):
     with db() as c:
         row = c.execute("SELECT code FROM cart_promos WHERE user_id=?", (user_id,)).fetchone()
         if row and items:
-            d, err = promo_discount(c, row["code"], user_id, subtotal)
+            lines = [(i["id"], eff_price(i["price"]), i["qty"]) for i in items]
+            d, err = promo_discount(c, row["code"], user_id, subtotal, lines)
             if d is None:
                 c.execute("DELETE FROM cart_promos WHERE user_id=?", (user_id,))
             else:
@@ -735,7 +752,8 @@ def place_order(user, payment):
         discount, code = 0, None
         prow = c.execute("SELECT code FROM cart_promos WHERE user_id=?", (user.id,)).fetchone()
         if prow:
-            d, perr = promo_discount(c, prow["code"], user.id, subtotal)
+            d, perr = promo_discount(
+                c, prow["code"], user.id, subtotal, [(i["id"], i["price"], i["qty"]) for i in items])
             if d is None:
                 c.execute("DELETE FROM cart_promos WHERE user_id=?", (user.id,))
                 return None, f"Промокод больше не действует: {perr} Проверьте корзину и оформите заказ ещё раз."
@@ -2251,8 +2269,9 @@ async def promo_apply(m: Message, code):
     if not items:
         await m.answer("Сначала добавьте товары в корзину: /menu")
         return True
+    lines = [(i["id"], eff_price(i["price"]), i["qty"]) for i in items]
     with db() as c:
-        d, err = promo_discount(c, code, m.from_user.id, subtotal)
+        d, err = promo_discount(c, code, m.from_user.id, subtotal, lines)
         if d is not None:
             c.execute(
                 "INSERT INTO cart_promos(user_id, code) VALUES(?,?) "
@@ -2737,6 +2756,7 @@ SELLER_HELP = (
     "🔥 <b>Акции и промокоды</b>\n"
     "/sale id цена — акционная цена (или /sale id -20%, /sale id - чтобы снять)\n"
     "/newpromo КОД 10% [лимит] или /newpromo КОД 50 [лимит] — создать промокод\n"
+    "/promoprice КОД id цена [id цена…] — промокод с особыми ценами на товары (id/артикул; цена «-» — убрать товар)\n"
     "/promos — список промокодов, /delpromo КОД — удалить\n\n"
     "📥 <b>Массовая загрузка</b>\n"
     "/template — образец файла, /export — выгрузить товары, /import — как загрузить\n"
@@ -3316,9 +3336,12 @@ async def s_newpromo(m: Message):
     parts = m.text.split()
     ok = len(parts) in (3, 4) and PROMO_RE.match(parts[1])
     percent = amount = 0
+    special = False
     if ok:
         d = parts[2]
-        if d.endswith("%") and d[:-1].isdigit() and 1 <= int(d[:-1]) <= 90:
+        if d.lower() in ("цены", "prices", "special"):
+            special = True  # промокод с особыми ценами — товары задаются через /promoprice
+        elif d.endswith("%") and d[:-1].isdigit() and 1 <= int(d[:-1]) <= 90:
             percent = int(d[:-1])
         elif d.isdigit() and int(d) > 0:
             amount = int(d)
@@ -3334,23 +3357,90 @@ async def s_newpromo(m: Message):
         await m.answer(
             "Формат: /newpromo КОД скидка [лимит]\n"
             "Скидка: 10% (от 1 до 90) или сумма в рублях, например 50.\n"
+            "Особые цены на товары: /newpromo КОД цены [лимит], затем /promoprice.\n"
             "Лимит — сколько раз можно использовать всего (по одному разу на человека).\n"
             "Например: /newpromo NIGHT10 10% 30   или   /newpromo WELCOME 50"
         )
         return
     code = parts[1].upper()
     with db() as c:
+        if not special:
+            c.execute("DELETE FROM promo_prices WHERE code=?", (code,))  # обычная скидка заменяет особые цены
         c.execute(
             "INSERT INTO promocodes(code, percent, amount, max_uses) VALUES(?,?,?,?) "
             "ON CONFLICT(code) DO UPDATE SET percent=excluded.percent, amount=excluded.amount, "
             "max_uses=excluded.max_uses",
             (code, percent, amount, limit),
         )
+    if special:
+        await m.answer(
+            f"🏷 Промокод <code>{code}</code> с особыми ценами создан"
+            + (f", лимит {limit}" if limit else ", без лимита")
+            + f"\nТеперь задайте цены: /promoprice {code} id цена [id цена…]"
+        )
+        return
     await m.answer(
         f"🏷 Промокод <code>{code}</code>: скидка "
         + (f"{percent}%" if percent else f"{amount} ₽")
         + (f", лимит {limit}" if limit else ", без лимита")
         + "\nПокупатель вводит его в корзине или командой /promo."
+    )
+
+
+@seller_router.message(Command("promoprice"))
+async def s_promoprice(m: Message):
+    """/promoprice КОД id цена [id цена …] — особые цены; цена «-» убирает товар из промокода."""
+    parts = m.text.split()
+    usage = (
+        "Формат: /promoprice КОД id цена [id цена …]\n"
+        "id можно заменить артикулом. Цена — финальная цена за штуку по этому промокоду.\n"
+        "Убрать товар из промокода: /promoprice КОД id -\n"
+        "Например: /promoprice VIP A001 90 A002 120\n"
+        "Если кода ещё нет, он будет создан (без лимита; лимит — /newpromo КОД цены 30)."
+    )
+    if len(parts) < 4 or (len(parts) - 2) % 2 or not PROMO_RE.match(parts[1]):
+        await m.answer(usage)
+        return
+    code = parts[1].upper()
+    pairs = []
+    for pid_s, val in zip(parts[2::2], parts[3::2]):
+        pid = find_pid(pid_s)
+        if pid is None:
+            await m.answer(f"Нет товара «{html.escape(pid_s)}». Ничего не изменено.")
+            return
+        if val != "-" and not (val.isdigit() and int(val) > 0):
+            await m.answer(f"Цена «{html.escape(val)}» не подходит: нужно целое число рублей или «-».")
+            return
+        pairs.append((pid, None if val == "-" else int(val)))
+    out = []
+    with db() as c:
+        ex = c.execute("SELECT percent, amount, owner_id FROM promocodes WHERE code=?", (code,)).fetchone()
+        if ex and ex["owner_id"] is not None:
+            await m.answer("Это личный код «Приведи друга» — особые цены для него задать нельзя.")
+            return
+        if not ex:
+            c.execute("INSERT INTO promocodes(code, percent, amount, max_uses) VALUES(?,0,0,NULL)", (code,))
+        for pid, price in pairs:
+            p = c.execute("SELECT name, price, sale_price FROM products WHERE id=?", (pid,)).fetchone()
+            name = html.escape(p["name"])
+            if price is None:
+                c.execute("DELETE FROM promo_prices WHERE code=? AND product_id=?", (code, pid))
+                out.append(f"• {name} — убран из промокода")
+            else:
+                c.execute(
+                    "INSERT INTO promo_prices(code, product_id, price) VALUES(?,?,?) "
+                    "ON CONFLICT(code, product_id) DO UPDATE SET price=excluded.price",
+                    (code, pid, price),
+                )
+                cur = p["sale_price"] or p["price"]
+                warn = f" ⚠️ не ниже текущей цены ({cur} ₽) — скидки не будет" if price >= cur else ""
+                out.append(f"• {name}: {cur} ₽ → <b>{price} ₽</b>{warn}")
+        left = c.execute("SELECT COUNT(*) FROM promo_prices WHERE code=?", (code,)).fetchone()[0]
+    await m.answer(
+        f"🏷 Промокод <code>{code}</code> — особые цены:\n" + "\n".join(out)
+        + ("" if left else "\n\n⚠️ Товаров в промокоде не осталось — он ничего не даёт. "
+           "Задайте цены или удалите: /delpromo " + code)
+        + "\n\nСписок: /promos"
     )
 
 
@@ -3365,11 +3455,19 @@ async def s_promos(m: Message):
             + (f"\n(личных кодов «Приведи друга»: {personal})" if personal else "")
         )
         return
+    with db() as c:
+        sp = {}
+        for x in c.execute(
+            "SELECT pp.code, pp.product_id, pp.price, p.name FROM promo_prices pp "
+            "LEFT JOIN products p ON p.id = pp.product_id ORDER BY pp.code, pp.product_id"
+        ):
+            sp.setdefault(x["code"], []).append(f"{x['name'] or x['product_id']} — {x['price']} ₽")
     lines = [
         f"<code>{r['code']}</code> — "
-        + (f"{r['percent']}%" if r["percent"] else f"{r['amount']} ₽")
+        + ("особые цены" if r["code"] in sp else f"{r['percent']}%" if r["percent"] else f"{r['amount']} ₽")
         + f" · использован {r['used']}"
         + (f" из {r['max_uses']}" if r["max_uses"] else " раз")
+        + "".join("\n    • " + html.escape(t) for t in sp.get(r["code"], []))
         for r in rows
     ]
     await m.answer(
@@ -3388,6 +3486,7 @@ async def s_delpromo(m: Message):
     with db() as c:
         cur = c.execute("DELETE FROM promocodes WHERE code=?", (parts[1].upper(),))
         c.execute("DELETE FROM cart_promos WHERE code=?", (parts[1].upper(),))
+        c.execute("DELETE FROM promo_prices WHERE code=?", (parts[1].upper(),))
     await m.answer("Удалён ✅" if cur.rowcount else "Такого промокода нет")
 
 
