@@ -4148,6 +4148,9 @@ async def s_broadcast(m: Message, state: FSMContext):
     await start_broadcast(m, state)
 
 
+BC_HTML_TAG_RE = re.compile(r"</?(b|i|u|s|em|strong|code|pre|a|tg-spoiler|blockquote)\b[^>]*>", re.I)
+
+
 @seller_router.message(Broadcast.content, F.text | F.photo)
 async def s_broadcast_content(m: Message, state: FSMContext):
     if m.text and m.text.startswith("/"):
@@ -4159,7 +4162,13 @@ async def s_broadcast_content(m: Message, state: FSMContext):
     if len(plain) > (900 if m.photo else 3500):
         await m.answer(f"Слишком длинно ({len(plain)} симв.): с фото — до 900, без фото — до 3500.")
         return
-    text = m.html_text if plain else ""
+    # Если форматирование вписано HTML-тегами вручную (<b>…</b>), берём текст как есть:
+    # m.html_text экранировал бы теги, и клиенты увидели бы их буквами.
+    # Иначе (обычное форматирование Telegram) переводим его в HTML.
+    if plain and BC_HTML_TAG_RE.search(plain):
+        text = plain
+    else:
+        text = m.html_text if plain else ""
     photo = m.photo[-1].file_id if m.photo else None
     try:  # предпросмотр — заодно проверяет, что разметка корректна
         if photo:
