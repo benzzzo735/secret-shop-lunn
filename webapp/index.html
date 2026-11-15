@@ -1,1 +1,254 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Secret Shop</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{
+  --bg:var(--tg-theme-bg-color,#150f2e);--fg:var(--tg-theme-text-color,#f3eefc);
+  --hint:var(--tg-theme-hint-color,#a79dc4);--link:var(--tg-theme-link-color,#f6d68c);
+  --btn:var(--tg-theme-button-color,#f6d68c);--btn-fg:var(--tg-theme-button-text-color,#1e0d3e);
+  --card:var(--tg-theme-secondary-bg-color,#211846);--line:rgba(127,127,160,.25);
+  --red:#e5534b;--green:#3fb97a;
+  box-sizing:border-box;padding-top:env(safe-area-inset-top,0);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.35 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif}
+button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
+input{font:inherit;color:var(--fg)}
+#app{max-width:640px;margin:0 auto;padding:12px 12px calc(96px + env(safe-area-inset-bottom,0))}
+.top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+h1{font-size:20px;margin:0}
+.seg{display:flex;background:var(--card);border-radius:12px;padding:3px;gap:3px}
+.seg button{flex:1;padding:8px 10px;border-radius:9px;color:var(--hint);font-weight:600}
+.seg button.on{background:var(--btn);color:var(--btn-fg)}
+.status{font-size:13px;color:var(--hint);margin:6px 0 10px}
+.banner{background:var(--card);border-radius:12px;padding:9px 12px;font-size:13px;color:var(--hint);margin-bottom:10px}
+.search{width:100%;padding:11px 14px;border-radius:12px;border:1px solid var(--line);background:var(--card);outline:none;margin-bottom:10px}
+.chips{display:flex;gap:8px;overflow-x:auto;padding-bottom:10px;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:none;padding:7px 13px;border-radius:99px;background:var(--card);color:var(--hint);font-weight:600;white-space:nowrap}
+.chip.on{background:var(--btn);color:var(--btn-fg)}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.card{background:var(--card);border-radius:16px;overflow:hidden;display:flex;flex-direction:column}
+.card .ph{aspect-ratio:1/1;background:rgba(127,127,160,.12);display:flex;align-items:center;justify-content:center;font-size:44px;position:relative}
+.card .ph img{width:100%;height:100%;object-fit:contain;padding:6px}
+.badge{position:absolute;top:8px;left:8px;background:var(--red);color:#fff;font-size:12px;font-weight:700;padding:2px 8px;border-radius:99px}
+.card .b{padding:9px 10px 10px;display:flex;flex-direction:column;gap:6px;flex:1}
+.name{font-size:13.5px;line-height:1.25;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;min-height:3.75em}
+.price{font-weight:800;font-size:17px}
+.price s{font-weight:400;font-size:13px;color:var(--hint);margin-left:6px}
+.add{background:var(--btn);color:var(--btn-fg);border-radius:11px;padding:9px;font-weight:700;width:100%}
+.add[disabled]{opacity:.45}
+.step{display:flex;align-items:center;justify-content:space-between;background:var(--card);border:1.5px solid var(--btn);border-radius:11px}
+.step button{width:40px;height:36px;font-size:20px;font-weight:700;color:var(--link)}
+.step b{min-width:24px;text-align:center}
+.empty{text-align:center;color:var(--hint);padding:40px 10px}
+.bar{position:fixed;left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0));max-width:616px;margin:0 auto;background:var(--btn);color:var(--btn-fg);border-radius:16px;padding:14px 18px;display:flex;justify-content:space-between;font-weight:800;box-shadow:0 8px 24px rgba(0,0,0,.35);z-index:5}
+.sheet-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:20;display:flex;align-items:flex-end;justify-content:center}
+.sheet{background:var(--bg);width:100%;max-width:640px;max-height:92vh;overflow:auto;border-radius:20px 20px 0 0;padding:16px 16px calc(20px + env(safe-area-inset-bottom,0))}
+.sheet .big{aspect-ratio:4/3;background:var(--card);border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:64px;margin-bottom:12px;overflow:hidden}
+.sheet .big img{width:100%;height:100%;object-fit:contain}
+.sheet h2{margin:0 0 6px;font-size:18px}
+.desc{color:var(--hint);white-space:pre-wrap;margin:8px 0 14px}
+.full{position:fixed;inset:0;background:var(--bg);z-index:15;overflow:auto;padding:12px 12px calc(30px + env(safe-area-inset-bottom,0));padding-top:calc(12px + env(safe-area-inset-top,0))}
+.full .in{max-width:640px;margin:0 auto}
+.row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}
+.row .n{flex:1;font-size:14px}.row .n small{display:block;color:var(--hint)}
+.row .step{width:112px;flex:none}
+.sum{background:var(--card);border-radius:14px;padding:12px 14px;margin:14px 0}
+.sum div{display:flex;justify-content:space-between;padding:3px 0}
+.sum .t{font-size:18px;font-weight:800;border-top:1px solid var(--line);margin-top:6px;padding-top:9px}
+.promo{display:flex;gap:8px;margin-top:12px}
+.promo input{flex:1;padding:11px 14px;border-radius:12px;border:1px solid var(--line);background:var(--card);text-transform:uppercase;outline:none}
+.promo button{padding:0 16px;border-radius:12px;background:var(--card);font-weight:700;color:var(--link)}
+.ok{color:var(--green)}.err{color:var(--red)}
+.cta{width:100%;background:var(--btn);color:var(--btn-fg);border-radius:14px;padding:15px;font-weight:800;font-size:16px;margin-top:6px}
+.cta[disabled]{opacity:.5}
+.ghost{width:100%;padding:12px;color:var(--link);font-weight:600}
+.order{background:var(--card);border-radius:14px;padding:12px 14px;margin-bottom:10px}
+.order .h{display:flex;justify-content:space-between;font-weight:700;margin-bottom:4px}
+.order .i{color:var(--hint);font-size:13px}
+.toast{position:fixed;left:50%;top:calc(14px + env(safe-area-inset-top,0));transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:9px 16px;border-radius:99px;font-size:14px;z-index:50;max-width:90%;text-align:center}
+.center{text-align:center;padding:40px 16px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+const tg = window.Telegram && Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); try { tg.setHeaderColor('bg_color'); } catch (e) {} }
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const hap = () => { try { tg.HapticFeedback.impactOccurred('light'); } catch (e) {} };
+const rub = n => n + ' ₽';
 
+let S = null, tab = 'shop', cat = 'all', q = '', view = null /* null|'cart'|'done' */, sheet = null, orders = null,
+    pay = null, busy = false, done = null, toastT = null;
+
+async function api(path, body) {
+  const r = await fetch('/api/' + path, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Init-Data': tg ? tg.initData : '' },
+    body: JSON.stringify(body || {}) });
+  if (r.status === 401) throw new Error('auth');
+  return r.json();
+}
+function toast(t) {
+  clearTimeout(toastT); $('.toast') && $('.toast').remove();
+  const d = document.createElement('div'); d.className = 'toast'; d.textContent = t; document.body.appendChild(d);
+  toastT = setTimeout(() => d.remove(), 2600);
+}
+function apply(st) { const keep = S && S.products; S = Object.assign(S || {}, st); if (!S.products) S.products = keep; }
+
+async function load() {
+  try { apply(await api('state')); render(); }
+  catch (e) {
+    $('#app').innerHTML = '<div class="center"><div style="font-size:48px">🔒</div><p>Откройте магазин через бота в Telegram.</p></div>';
+  }
+}
+async function setQty(pid, qty) {
+  const key = String(pid), prev = S.cart[key] || 0;
+  if (qty <= 0) delete S.cart[key]; else S.cart[key] = qty;
+  hap(); render();
+  try {
+    const st = await api('cart', { pid, qty });
+    apply(st); if (st.note) toast(st.note);
+  } catch (e) { toast('Нет связи'); if (prev) S.cart[key] = prev; else delete S.cart[key]; }
+  render();
+}
+const qtyOf = id => S.cart[String(id)] || 0;
+const cartCount = () => Object.values(S.cart).reduce((a, b) => a + b, 0);
+const prod = id => S.products.find(p => p.id === id);
+
+function stepper(p) {
+  const n = qtyOf(p.id);
+  if (p.stock <= 0) return '<button class="add" disabled>Нет в наличии</button>';
+  if (!n) return `<button class="add" data-add="${p.id}">В корзину</button>`;
+  return `<div class="step"><button data-dec="${p.id}">−</button><b>${n}</b><button data-inc="${p.id}">+</button></div>`;
+}
+function photo(p) { return p.photo ? `<img loading="lazy" src="/api/photo/${p.id}" alt="">` : '🛍'; }
+
+function render() {
+  if (!S) return;
+  const app = $('#app');
+  const cats = [...new Set(S.products.map(p => p.cat).filter(Boolean))];
+  const hasSale = S.products.some(p => p.old);
+  let list = S.products.filter(p => (cat === 'all' || (cat === 'sale' ? p.old : p.cat === cat)) &&
+    (!q || p.name.toLowerCase().includes(q.toLowerCase())));
+  let h = `<div class="top"><h1>🌙 Secret Shop</h1>
+    <div class="seg" style="width:190px"><button data-tab="shop" class="${tab==='shop'?'on':''}">Магазин</button>
+    <button data-tab="orders" class="${tab==='orders'?'on':''}">Заказы</button></div></div>
+    <div class="status">${esc(S.status)}</div>`;
+  if (tab === 'shop') {
+    h += `<div class="banner">${esc(S.tariff)}</div>
+      <input class="search" id="q" placeholder="🔎 Поиск по товарам" value="${esc(q)}">
+      <div class="chips"><button class="chip ${cat==='all'?'on':''}" data-cat="all">Все</button>
+      ${hasSale ? `<button class="chip ${cat==='sale'?'on':''}" data-cat="sale">🔥 Акции</button>` : ''}
+      ${cats.map(c => `<button class="chip ${cat===c?'on':''}" data-cat="${esc(c)}">${esc(c)}</button>`).join('')}</div>`;
+    h += list.length ? '<div class="grid">' + list.map(p => `<div class="card">
+      <div class="ph" data-open="${p.id}">${photo(p)}${p.old ? '<span class="badge">Акция</span>' : ''}</div>
+      <div class="b"><div class="name" data-open="${p.id}">${esc(p.name)}</div>
+      <div class="price">${rub(p.price)}${p.old ? `<s>${rub(p.old)}</s>` : ''}</div>${stepper(p)}</div></div>`).join('') + '</div>'
+      : '<div class="empty">Ничего не найдено</div>';
+    if (cartCount() > 0)
+      h += `<button class="bar" data-cart><span>🛒 Корзина · ${cartCount()} шт.</span><span>${rub(S.total)}</span></button>`;
+  } else {
+    h += orders === null ? '<div class="empty">Загрузка…</div>' : orders.length ? orders.map(o => `<div class="order">
+      <div class="h"><span>Заказ #${o.id}</span><span>${rub(o.total)}</span></div>
+      <div>${o.icon} ${esc(o.label)} <span class="i">· ${esc(o.date)}</span></div>
+      <div class="i">${o.items.map(esc).join(', ')}</div></div>`).join('') : '<div class="empty">Заказов пока нет</div>';
+  }
+  const keepQ = tab === 'shop' && document.activeElement && document.activeElement.id === 'q';
+  app.innerHTML = h;
+  if (keepQ) { const i = $('#q'); i.focus(); i.setSelectionRange(q.length, q.length); }
+  renderOverlays();
+}
+
+function renderOverlays() {
+  document.querySelectorAll('.sheet-bg,.full').forEach(e => e.remove());
+  if (view === 'cart') document.body.appendChild(cartView());
+  if (view === 'done') document.body.appendChild(doneView());
+  if (sheet) document.body.appendChild(sheetView(sheet));
+}
+function sheetView(id) {
+  const p = prod(id), d = document.createElement('div'); d.className = 'sheet-bg';
+  if (!p) return d;
+  d.innerHTML = `<div class="sheet"><div class="big">${photo(p)}</div><h2>${esc(p.name)}</h2>
+    <div class="price" style="font-size:20px">${rub(p.price)}${p.old ? `<s>${rub(p.old)}</s>` : ''}</div>
+    ${p.desc ? `<div class="desc">${esc(p.desc)}</div>` : '<div style="height:12px"></div>'}
+    <div class="sheetctl">${stepper(p)}</div>
+    <button class="ghost" data-close>Закрыть</button></div>`;
+  d.addEventListener('click', e => { if (e.target === d || e.target.dataset.close !== undefined) { sheet = null; render(); } });
+  return d;
+}
+function cartView() {
+  const d = document.createElement('div'); d.className = 'full';
+  const items = Object.keys(S.cart).map(k => prod(+k)).filter(Boolean);
+  if (!pay) pay = Object.keys(S.pay)[0];
+  const canOrder = S.open && items.length && !busy;
+  d.innerHTML = `<div class="in"><div class="top"><h1>🛒 Корзина</h1><button class="chip" data-back>← Назад</button></div>
+   ${items.length ? items.map(p => `<div class="row"><div class="n">${esc(p.name)}<small>${rub(p.price)} × ${qtyOf(p.id)}</small></div>
+     <div class="step"><button data-dec="${p.id}">−</button><b>${qtyOf(p.id)}</b><button data-inc="${p.id}">+</button></div></div>`).join('')
+     : '<div class="empty">Корзина пуста</div>'}
+   ${items.length ? `<div class="promo"><input id="pc" placeholder="Промокод" value="${esc(S.promo || '')}" ${S.promo ? 'readonly' : ''}>
+     <button data-promo>${S.promo ? 'Убрать' : 'Применить'}</button></div>
+     <div id="pmsg" class="${S.promo ? 'ok' : 'err'}" style="font-size:13px;margin-top:6px">${S.promo ? '✅ Промокод ' + esc(S.promo) + ' применён' : ''}</div>
+     <div class="sum"><div><span>Товары</span><span>${rub(S.subtotal)}</span></div>
+     ${S.discount ? `<div class="ok"><span>Скидка</span><span>−${rub(S.discount)}</span></div>` : ''}
+     ${S.fee ? `<div><span>Доплата за малый заказ (до ${S.min_order} ₽)</span><span>+${rub(S.fee)}</span></div>` : ''}
+     <div class="t"><span>Итого</span><span>${rub(S.total)}</span></div></div>
+     <div class="seg" style="margin-bottom:12px">${Object.entries(S.pay).map(([k, v]) =>
+       `<button data-pay="${k}" class="${pay===k?'on':''}">${k==='cash'?'💵':'💸'} ${esc(v[0].toUpperCase()+v.slice(1))}</button>`).join('')}</div>
+     <button class="cta" data-order ${canOrder ? '' : 'disabled'}>${S.open ? (busy ? 'Оформляем…' : 'Оформить заказ · ' + rub(S.total)) : esc(S.status)}</button>` : ''}
+   </div>`;
+  return d;
+}
+function doneView() {
+  const d = document.createElement('div'); d.className = 'full';
+  d.innerHTML = `<div class="in center"><div style="font-size:64px">✅</div><h1>Заказ #${done.id} принят!</h1>
+   <p style="font-size:18px"><b>${rub(done.total)}</b></p>
+   ${done.discount ? `<p class="ok">Скидка по промокоду: −${rub(done.discount)}</p>` : ''}
+   ${done.payment === 'transfer' ? `<div class="sum" style="text-align:left"><b>💸 Оплата переводом</b><br>${esc(done.info)}
+      <br><br>Затем нажмите «Я оплатил(а)» в сообщении от бота.${done.reserve ? `<br>⏱ Бронь — ${done.reserve} мин.` : ''}</div>`
+      : '<p>💵 Оплата наличными при получении.</p>'}
+   <p style="color:var(--hint)">Подтверждение отправили в чат с ботом. Напишем, когда соберём заказ.</p>
+   <button class="cta" data-finish>Готово</button></div>`;
+  return d;
+}
+
+document.addEventListener('click', async e => {
+  const t = e.target.closest('button,[data-open]'); if (!t || !S) return;
+  const ds = t.dataset;
+  if (ds.tab) { tab = ds.tab; if (tab === 'orders') { orders = null; render(); try { orders = (await api('orders')).orders; } catch (x) { orders = []; } } render(); }
+  else if (ds.cat !== undefined) { cat = ds.cat; render(); }
+  else if (ds.open) { sheet = +ds.open; render(); }
+  else if (ds.add) setQty(+ds.add, 1);
+  else if (ds.inc) setQty(+ds.inc, qtyOf(+ds.inc) + 1);
+  else if (ds.dec) setQty(+ds.dec, qtyOf(+ds.dec) - 1);
+  else if (ds.cart !== undefined) { view = 'cart'; render(); }
+  else if (ds.back !== undefined) { view = null; render(); }
+  else if (ds.pay) { pay = ds.pay; render(); }
+  else if (ds.promo !== undefined) {
+    const code = S.promo ? '' : ($('#pc').value || '').trim();
+    if (!S.promo && !code) return;
+    const r = await api('promo', { code }); apply(r); render();
+    if (r.error) { const m = $('#pmsg'); if (m) m.textContent = '⚠️ ' + r.error; } else if (r.note) toast(r.note);
+  }
+  else if (ds.order !== undefined && !busy) {
+    busy = true; render();
+    try {
+      const r = await api('order', { payment: pay });
+      if (r.ok) { done = r; apply(r.state); view = 'done'; try { tg.HapticFeedback.notificationOccurred('success'); } catch (x) {} }
+      else toast(r.error || 'Не получилось оформить заказ');
+    } catch (x) { toast('Нет связи, попробуйте ещё раз'); }
+    busy = false; render();
+  }
+  else if (ds.finish !== undefined) { view = null; done = null; render(); if (tg) tg.close(); }
+});
+document.addEventListener('input', e => { if (e.target.id === 'q') { q = e.target.value; render(); } });
+load();
+</script>
+</body>
+</html>
