@@ -1,0 +1,15 @@
+# Секреты и живые данные магазина — не должны попадать в GitHub
+.env
+shop.db
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+photos/
+*.bak
+
+# Мусор Python
+__pycache__/
+*.pyc
+venv/
+.venv/
