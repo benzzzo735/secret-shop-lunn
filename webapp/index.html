@@ -140,7 +140,7 @@ function render() {
   let h = `<div class="top"><h1>🌙 Secret Shop</h1>
     <div class="seg" style="width:190px"><button data-tab="shop" class="${tab==='shop'?'on':''}">Магазин</button>
     <button data-tab="orders" class="${tab==='orders'?'on':''}">Заказы</button></div></div>
-    <div class="status">${esc(S.status)}</div>`;
+    <div class="status">${esc(S.status)} ${S.is_admin ? '<button class="chip" data-admin style="padding:3px 10px;margin-left:6px">⚙️ Админ</button>' : ''}</div>`;
   if (tab === 'shop') {
     h += `<div class="banner">${esc(S.tariff)}</div>
       <input class="search" id="q" placeholder="🔎 Поиск по товарам" value="${esc(q)}">
@@ -155,15 +155,27 @@ function render() {
     if (cartCount() > 0)
       h += `<button class="bar" data-cart><span>🛒 Корзина · ${cartCount()} шт.</span><span>${rub(S.total)}</span></button>`;
   } else {
-    h += orders === null ? '<div class="empty">Загрузка…</div>' : orders.length ? orders.map(o => `<div class="order">
-      <div class="h"><span>Заказ #${o.id}</span><span>${rub(o.total)}</span></div>
-      <div>${o.icon} ${esc(o.label)} <span class="i">· ${esc(o.date)}</span></div>
-      <div class="i">${o.items.map(esc).join(', ')}</div></div>`).join('') : '<div class="empty">Заказов пока нет</div>';
+    h += orders === null ? '<div class="empty">Загрузка…</div>' : orders.length ? orders.map(orderCard).join('') : '<div class="empty">Заказов пока нет</div>';
   }
   const keepQ = tab === 'shop' && document.activeElement && document.activeElement.id === 'q';
   app.innerHTML = h;
   if (keepQ) { const i = $('#q'); i.focus(); i.setSelectionRange(q.length, q.length); }
   renderOverlays();
+}
+
+const PAYST = { unpaid: 'ждём оплату', claimed: 'оплата на проверке', paid: 'оплачено' };
+function orderCard(o) {
+  return `<div class="order"><div class="h"><span>Заказ #${o.id}</span><span>${rub(o.total)}</span></div>
+    <div>${o.icon} <b>${esc(o.label)}</b> · ${o.payment === 'cash' ? '💵 наличные' : '💸 перевод, ' + (PAYST[o.pay_status] || '')}</div>
+    ${o.room ? `<div>📍 Забирать: <b>${esc(o.room)}</b></div>` : ''}
+    <div class="i">${o.items.map(i => esc(i.name) + ' ×' + i.qty).join(', ')}</div><div class="i">${esc(o.date)}</div>
+    ${o.can_cancel ? `<button class="ghost err" data-cancel="${o.id}" style="padding:8px 0 0;text-align:left">Отменить заказ</button>` : ''}</div>`;
+}
+async function refreshOrders() { try { orders = (await api('orders')).orders; } catch (x) {} if (tab === 'orders' && !view && !sheet) render(); }
+setInterval(() => { if (S && tab === 'orders' && !document.hidden) refreshOrders(); }, 15000);
+function openAdminPanel() {
+  if (window.openAdmin) return window.openAdmin();
+  const sc = document.createElement('script'); sc.src = '/admin.js?v=' + Date.now(); sc.onload = () => window.openAdmin(); document.body.appendChild(sc);
 }
 
 function renderOverlays() {
@@ -221,12 +233,17 @@ function doneView() {
 document.addEventListener('click', async e => {
   const t = e.target.closest('button,[data-open]'); if (!t || !S) return;
   const ds = t.dataset;
-  if (ds.tab) { tab = ds.tab; if (tab === 'orders') { orders = null; render(); try { orders = (await api('orders')).orders; } catch (x) { orders = []; } } render(); }
+  if (ds.tab) { tab = ds.tab; if (tab === 'orders') { orders = null; render(); await refreshOrders(); if (orders === null) orders = []; } render(); }
   else if (ds.cat !== undefined) { cat = ds.cat; render(); }
   else if (ds.open) { sheet = +ds.open; render(); }
   else if (ds.add) setQty(+ds.add, 1);
   else if (ds.inc) setQty(+ds.inc, qtyOf(+ds.inc) + 1);
   else if (ds.dec) setQty(+ds.dec, qtyOf(+ds.dec) - 1);
+  else if (ds.admin !== undefined) openAdminPanel();
+  else if (ds.cancel) {
+    const go = async () => { const r = await api('order_cancel', { id: +ds.cancel }); if (r.error) toast(r.error); else toast('Заказ отменён'); refreshOrders(); load(); };
+    tg && tg.showConfirm ? tg.showConfirm('Отменить заказ #' + ds.cancel + '?', ok => ok && go()) : confirm('Отменить заказ?') && go();
+  }
   else if (ds.cart !== undefined) { view = 'cart'; render(); }
   else if (ds.back !== undefined) { view = null; render(); }
   else if (ds.pay) { pay = ds.pay; render(); }
