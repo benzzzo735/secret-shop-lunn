@@ -4643,6 +4643,7 @@ def mini_state(user_id):
         "open": is_open, "status": status, "tariff": tariff_note(),
         "min_order": MIN_ORDER, "small_fee": SMALL_ORDER_FEE,
         "pay": {k: v for k, v in PAY_LABELS.items()},
+        "is_admin": user_id == ADMIN_ID,
     }
 
 
@@ -4767,19 +4768,234 @@ async def api_order(user, body):
             "reserve": RESERVE_MINUTES if payment == "transfer" else 0, "state": mini_state(user.id)}
 
 
+def order_json(o):
+    return {
+        "id": o["id"], "total": o["total"], "status": o["status"], "label": STATUS_LABELS.get(o["status"], o["status"]),
+        "icon": STATUS_ICONS.get(o["status"], ""), "date": o["created_at"], "room": o["room"] or "",
+        "payment": o["payment"], "pay_status": o["pay_status"], "discount": o["discount"] or 0, "fee": o["fee"] or 0,
+        "promo": o["promo_code"] or "", "who": o["full_name"] or "", "username": o["username"] or "",
+        "can_cancel": o["status"] == "new" and o["pay_status"] != "paid",
+        "items": [{"name": i["name"], "qty": i["qty"], "price": i["price"]} for i in json.loads(o["items_json"])],
+    }
+
+
 @api
 async def api_orders(user, body):
     with db() as c:
         rows = c.execute("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 15", (user.id,)).fetchall()
-    return {"orders": [{
-        "id": o["id"], "total": o["total"], "status": o["status"], "label": STATUS_LABELS.get(o["status"], o["status"]),
-        "icon": STATUS_ICONS.get(o["status"], ""), "date": o["created_at"],
-        "items": [f"{i['name']} ×{i['qty']}" for i in json.loads(o["items_json"])],
-    } for o in rows]}
+    return {"orders": [order_json(o) for o in rows]}
+
+
+@api
+async def api_order_cancel(user, body):
+    try:
+        oid = int(body.get("id"))
+    except (TypeError, ValueError):
+        return {"error": "Некорректный запрос."}
+    with db() as c:
+        o = c.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (oid, user.id)).fetchone()
+        if not o:
+            return {"error": "Заказ не найден."}
+        if o["status"] != "new" or o["pay_status"] == "paid":
+            return {"error": "Этот заказ уже нельзя отменить здесь — напишите продавцу."}
+        release_order(c, o)
+        c.execute("UPDATE orders SET status='cancelled' WHERE id=?", (oid,))
+    fire_and_forget(alarm_cancel(oid))
+    await notify_seller(f"❌ Клиент {html.escape(user.full_name)} отменил заказ #{oid} ({o['total']} ₽).")
+    return {"ok": True}
+
+
+# ── Панель продавца (только для ADMIN_ID) ──
+def admin_api(handler):
+    async def guarded(user, body):
+        if user.id != ADMIN_ID:
+            return {"error": "Нет доступа"}
+        return await handler(user, body)
+    return api(guarded)
+
+
+@admin_api
+async def adm_orders(user, body):
+    where = " WHERE status IN ('new','ready')" if body.get("filter", "active") == "active" else ""
+    with db() as c:
+        rows = c.execute(f"SELECT * FROM orders{where} ORDER BY id DESC LIMIT 60").fetchall()
+    return {"orders": [order_json(o) for o in rows]}
+
+
+@admin_api
+async def adm_order_action(user, body):
+    try:
+        oid = int(body.get("id"))
+    except (TypeError, ValueError):
+        return {"error": "Некорректный запрос."}
+    action, room = body.get("action"), str(body.get("room") or "").strip()
+    o = get_order(oid)
+    if not o:
+        return {"error": "Заказ не найден"}
+    if o["status"] not in ACTIVE_STATUSES:
+        return {"error": "Заказ уже обработан"}
+    fire_and_forget(alarm_cancel(oid))  # продавец занялся заказом — гасим будильник
+    note, refund = None, False
+    with db() as c:
+        if action == "paid":
+            c.execute("UPDATE orders SET pay_status='paid' WHERE id=?", (oid,))
+            note = f"✅ Оплата заказа #{oid} подтверждена. Спасибо!"
+        elif action == "nopay":
+            c.execute("UPDATE orders SET pay_status='unpaid', reminded=2 WHERE id=?", (oid,))
+            note = (f"⚠️ Оплата заказа #{oid} пока не найдена. Проверьте перевод и нажмите "
+                    "«Я оплатил(а)» ещё раз (/myorders) или напишите продавцу.")
+        elif action == "done":
+            if o["payment"] == "transfer" and o["pay_status"] != "paid":
+                return {"error": "Сначала подтвердите оплату переводом."}
+            c.execute("UPDATE orders SET status='done', pay_status='paid' WHERE id=?", (oid,))
+            note = f"🤝 Заказ #{oid} выдан. Приятного аппетита!"
+        elif action == "cancel":
+            release_order(c, o)
+            c.execute("UPDATE orders SET status='cancelled' WHERE id=?", (oid,))
+            refund = o["payment"] == "transfer" and o["pay_status"] == "paid"
+            note = f"Заказ #{oid} отменён. Если это ошибка — напишите продавцу."
+        elif action == "room":
+            if not room or len(room) > 60:
+                return {"error": "Комната — короткий текст до 60 символов."}
+            c.execute("UPDATE orders SET room=?, status='ready' WHERE id=?", (room, oid))
+            note = f"📦 <b>Заказ #{oid} собран!</b>\nЗабирайте здесь: <b>{html.escape(room)}</b>"
+            if o["payment"] == "transfer" and o["pay_status"] != "paid":
+                note += "\n\n💸 Оплата ещё не подтверждена: переведите сумму и нажмите «Я оплатил(а)» (/myorders)."
+        else:
+            return {"error": "Неизвестное действие"}
+    await tell_customer(o["user_id"], note)
+    if action == "done":
+        res = referral_reward(o)
+        if res:
+            rid, code = res
+            await tell_customer(
+                rid, f"🎉 Ваш друг сделал первый заказ! Подарок вам: промокод <code>{code}</code> — "
+                     f"<b>−{REF_REWARD_TEXT}</b> на любой заказ (/promo {code}).")
+    return {"ok": True, "order": order_json(get_order(oid)), "refund": o["total"] if refund else 0}
+
+
+@admin_api
+async def adm_products(user, body):
+    with db() as c:
+        rows = c.execute("SELECT * FROM products ORDER BY id").fetchall()
+    return {"products": [{
+        "id": p["id"], "sku": p["sku"] or "", "name": p["name"], "price": p["price"], "sale_price": p["sale_price"],
+        "cost": p["cost"], "stock": p["stock"], "cat": p["category"] or "", "desc": p["description"] or "",
+        "active": bool(p["active"]), "photo": web_photo(p) is not None,
+    } for p in rows]}
+
+
+@admin_api
+async def adm_product_save(user, body):
+    try:
+        name, price, stock = str(body.get("name") or "").strip()[:80], int(body["price"]), int(body["stock"])
+        cost = float(body["cost"]) if body.get("cost") not in (None, "") else None
+        sale = int(body["sale_price"]) if body.get("sale_price") not in (None, "", 0, "0") else None
+    except (KeyError, ValueError, TypeError):
+        return {"error": "Проверьте числа в полях."}
+    if not name or price <= 0 or stock < 0 or (cost is not None and cost < 0) or (sale is not None and not 0 < sale < price):
+        return {"error": "Проверьте поля: название, цена > 0, остаток ≥ 0, акционная цена ниже обычной."}
+    cat, desc = str(body.get("category") or "").strip()[:30], str(body.get("description") or "").strip()[:600]
+    active, pid = 1 if body.get("active", True) else 0, body.get("id")
+    with db() as c:
+        if pid:
+            cur = c.execute(
+                "UPDATE products SET name=?, price=?, stock=?, cost=?, sale_price=?, category=?, description=?, active=? "
+                "WHERE id=?", (name, price, stock, cost, sale, cat, desc, active, int(pid)))
+            if not cur.rowcount:
+                return {"error": "Товар не найден"}
+        else:
+            cur = c.execute(
+                "INSERT INTO products(name, price, stock, cost, sale_price, category, description, active) "
+                "VALUES(?,?,?,?,?,?,?,?)", (name, price, stock, cost, sale, cat, desc, active))
+            pid = cur.lastrowid
+            c.execute("UPDATE products SET sku=? WHERE id=?", (make_sku(c, pid), pid))
+    return {"ok": True, "id": pid}
+
+
+@admin_api
+async def adm_product_delete(user, body):
+    try:
+        pid = int(body.get("id"))
+    except (TypeError, ValueError):
+        return {"error": "Некорректный запрос."}
+    with db() as c:
+        c.execute("DELETE FROM carts WHERE product_id=?", (pid,))
+        c.execute("DELETE FROM stock_subs WHERE product_id=?", (pid,))
+        c.execute("DELETE FROM promo_prices WHERE product_id=?", (pid,))
+        c.execute("DELETE FROM products WHERE id=?", (pid,))
+        changes = resequence_skus(c)
+    return {"ok": True, "renumbered": len(changes)}
+
+
+async def adm_photo(request):
+    """Загрузка фото товара из приложения (multipart: id + file)."""
+    user = verify_init_data(request.headers.get("X-Init-Data", ""))
+    if not user or user.id != ADMIN_ID:
+        return web.json_response({"error": "Нет доступа"}, status=401)
+    pid = data = None
+    try:
+        async for part in await request.multipart():
+            if part.name == "id":
+                pid = int((await part.text()).strip())
+            elif part.name == "file":
+                data = await part.read(decode=False)
+    except Exception:
+        return web.json_response({"error": "Не удалось прочитать файл."})
+    if not pid or not data or len(data) > 8 * 1024 * 1024:
+        return web.json_response({"error": "Нужна картинка до 8 МБ."})
+    ext = ".jpg" if data[:2] == b"\xff\xd8" else ".png" if data[:4] == b"\x89PNG" else ".webp" if data[8:12] == b"WEBP" else None
+    if not ext:
+        return web.json_response({"error": "Подходят JPG, PNG или WebP."})
+    os.makedirs(PHOTOS_DIR, exist_ok=True)
+    fname = f"p{pid}_{int(time.time())}{ext}"
+    with open(os.path.join(PHOTOS_DIR, fname), "wb") as f:
+        f.write(data)
+    with db() as c:
+        cur = c.execute("UPDATE products SET photo=?, photo_fid=NULL WHERE id=?", (fname, pid))
+    return web.json_response({"ok": bool(cur.rowcount)})
+
+
+@admin_api
+async def adm_stats(user, body):
+    days = min(max(int(body.get("days") or 7), 1), 365)
+    fmt = "%Y-%m-%d %H:%M:%S"
+    now = datetime.now(ZoneInfo(TZ))
+    start = (now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    with db() as c:
+        costs = {r["id"]: r["cost"] for r in c.execute("SELECT id, cost FROM products")}
+        rows = c.execute("SELECT * FROM orders WHERE status='done' AND created_at>=?", (start.strftime(fmt),)).fetchall()
+    series = {(start + timedelta(days=i)).strftime("%Y-%m-%d"): {"rev": 0, "profit": 0.0, "n": 0} for i in range(days)}
+    for o in rows:
+        row = series.get(o["created_at"][:10])
+        if row is None:
+            continue
+        gain = 0.0
+        for i in json.loads(o["items_json"]):
+            cost = i.get("cost") if i.get("cost") is not None else costs.get(i["id"])
+            if cost is not None:
+                gain += (i["price"] - cost) * i["qty"]
+        row["rev"] += o["total"]
+        row["profit"] += gain - (o["discount"] or 0) + (o["fee"] or 0)
+        row["n"] += 1
+    d = compute_stats(start.strftime(fmt))
+    return {
+        "series": [{"d": k[8:10] + "." + k[5:7], "rev": v["rev"], "profit": round(v["profit"]), "n": v["n"]}
+                   for k, v in series.items()],
+        "kpi": {"revenue": d["revenue"], "profit": round(d["profit"]), "done": d["done"], "avg": round(d["avg"]),
+                "active": d["active"], "cancelled": d["cancelled"], "pending": d["pending"],
+                "buyers": d["buyers"], "repeat": d["repeat"]},
+        "top": [{"name": n, "qty": v["qty"], "rev": v["rev"]} for n, v in d["top"]],
+        "low": [{"name": r["name"], "stock": r["stock"]} for r in d["low"]],
+    }
 
 
 async def web_index(request):
     return web.FileResponse(os.path.join(WEBAPP_DIR, "index.html"), headers={"Cache-Control": "no-cache"})
+
+
+async def web_admin_js(request):
+    return web.FileResponse(os.path.join(WEBAPP_DIR, "admin.js"), headers={"Cache-Control": "no-cache"})
 
 
 async def web_health(request):
@@ -4828,13 +5044,18 @@ async def miniapp_server():
     if not WEBAPP_URL:
         logging.info("Mini App выключен: не задан WEBAPP_URL")
         return
-    app = web.Application()
+    app = web.Application(client_max_size=10 * 1024 * 1024)
     app.router.add_get("/", web_index)
+    app.router.add_get("/admin.js", web_admin_js)
     app.router.add_get("/healthz", web_health)
     app.router.add_get("/api/photo/{pid}", web_photo_handler)
     for path, h in (("state", api_state), ("cart", api_cart), ("promo", api_promo),
-                    ("order", api_order), ("orders", api_orders)):
+                    ("order", api_order), ("orders", api_orders), ("order_cancel", api_order_cancel),
+                    ("admin/orders", adm_orders), ("admin/order_action", adm_order_action),
+                    ("admin/products", adm_products), ("admin/product_save", adm_product_save),
+                    ("admin/product_delete", adm_product_delete), ("admin/stats", adm_stats)):
         app.router.add_post(f"/api/{path}", h)
+    app.router.add_post("/api/admin/photo", adm_photo)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", WEBAPP_PORT).start()
