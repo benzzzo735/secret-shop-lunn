@@ -18,20 +18,17 @@ import logging
 import os
 import random
 import re
-import signal
 import socket
 import sqlite3
 import tempfile
 import textwrap
 import time
-import urllib.error
-import urllib.request
 import zipfile
 import zlib
 from collections import Counter, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -74,8 +71,18 @@ CLOSE_HOUR = int(os.getenv("CLOSE_HOUR", "6"))
 SURCHARGE_PERCENT = int(os.getenv("SURCHARGE_PERCENT", "30"))
 SURCHARGE_FROM = int(os.getenv("SURCHARGE_FROM", "2"))
 SURCHARGE_TO = int(os.getenv("SURCHARGE_TO", "6"))
-PHOTOS_DIR = os.getenv("PHOTOS_DIR", os.path.join(BASE_DIR, "photos"))
-DB_PATH = os.getenv("DB_PATH", os.path.join(BASE_DIR, "shop.db"))
+# На хостингах данные переживают обновления только в особой папке (/data у FadeHost, /app/data у Bothost).
+# Если она есть — бот сам кладёт туда базу и фото, даже если переменные DB_PATH/PHOTOS_DIR не заданы.
+def _default_data_dir():
+    for d in ("/data", "/app/data"):
+        if os.path.isdir(d) and os.access(d, os.W_OK):
+            return d
+    return BASE_DIR
+
+
+DATA_DIR = _default_data_dir()
+PHOTOS_DIR = os.getenv("PHOTOS_DIR", os.path.join(DATA_DIR, "photos"))
+DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "shop.db"))
 # Режим работы: пусто = круглосуточно. Можно менять прямо из бота продавца: /hours 22:00 06:00
 WORK_FROM = os.getenv("WORK_FROM", "")
 WORK_TO = os.getenv("WORK_TO", "")
@@ -83,9 +90,6 @@ WORK_TO = os.getenv("WORK_TO", "")
 RESERVE_MINUTES = int(os.getenv("RESERVE_MINUTES", "20"))
 # Уведомлять продавца, когда остаток товара стал таким или меньше
 LOW_STOCK = int(os.getenv("LOW_STOCK", "2"))
-# Защита данных: сводка о базе при каждом запуске и свежая копия при остановке бота
-STARTUP_NOTICE = os.getenv("STARTUP_NOTICE", "1") == "1"
-BACKUP_ON_STOP = os.getenv("BACKUP_ON_STOP", "1") == "1"
 # Ежедневная резервная копия (база + фото) в личку продавцу; "off" — выключить
 BACKUP_TIME = os.getenv("BACKUP_TIME", "04:00")
 # Автоотчёт после ночной смены; по умолчанию через 10 минут после CLOSE_HOUR; "off" — выключить
@@ -101,32 +105,6 @@ REF_FRIEND_AMOUNT = int(os.getenv("REF_FRIEND_AMOUNT", "30"))
 REF_REWARD_AMOUNT = int(os.getenv("REF_REWARD_AMOUNT", "30"))
 REF_MIN_TOTAL = int(os.getenv("REF_MIN_TOTAL", "100"))  # награда — когда заказ друга выдан и не меньше этой суммы
 REF_MAX_REWARDS = int(os.getenv("REF_MAX_REWARDS", "5"))  # максимум наград одному человеку (0 — без лимита)
-# «Приведи друга» в процентах: скидка другу и награда пригласившему, % от суммы заказа.
-# Если процент 0 — берётся фиксированная сумма REF_FRIEND_AMOUNT / REF_REWARD_AMOUNT.
-REF_FRIEND_PERCENT = int(os.getenv("REF_FRIEND_PERCENT", "10"))
-REF_REWARD_PERCENT = int(os.getenv("REF_REWARD_PERCENT", "10"))
-REF_FRIEND_ON = REF_FRIEND_PERCENT > 0 or REF_FRIEND_AMOUNT > 0
-REF_REWARD_ON = REF_REWARD_PERCENT > 0 or REF_REWARD_AMOUNT > 0
-REF_FRIEND_TEXT = f"{REF_FRIEND_PERCENT}%" if REF_FRIEND_PERCENT > 0 else f"{REF_FRIEND_AMOUNT} ₽"
-REF_REWARD_TEXT = f"{REF_REWARD_PERCENT}%" if REF_REWARD_PERCENT > 0 else f"{REF_REWARD_AMOUNT} ₽"
-# Минимальный заказ: если товаров меньше чем на MIN_ORDER ₽, заказ всё равно можно оформить —
-# за доплату SMALL_ORDER_FEE ₽ (на любую сумму). MIN_ORDER=0 — без минимума.
-MIN_ORDER = int(os.getenv("MIN_ORDER", "100"))
-SMALL_ORDER_FEE = int(os.getenv("SMALL_ORDER_FEE", "20"))
-# Будильник о заказе: «экстренное» уведомление Pushover на телефон продавца. Пробивает «Не беспокоить»,
-# повторяется каждые ALARM_RETRY сек (минимум 30), пока не нажмёте «принято», но не дольше ALARM_EXPIRE сек
-# (максимум 10800). Пустые PUSHOVER_TOKEN / PUSHOVER_USER — будильник выключен.
-PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "").strip()  # токен приложения (pushover.net/apps/build)
-PUSHOVER_USER = os.getenv("PUSHOVER_USER", "").strip()  # ваш User Key (на главной pushover.net)
-ALARM_RETRY = max(int(os.getenv("ALARM_RETRY", "30")), 30)
-ALARM_EXPIRE = min(max(int(os.getenv("ALARM_EXPIRE", "1800")), 60), 10800)
-ALARM_SOUND = os.getenv("ALARM_SOUND", "siren")
-# Часы, когда будильник работает (по TIMEZONE). Пусто — всегда. Например ALARM_FROM=23, ALARM_TO=7.
-ALARM_FROM = int(os.getenv("ALARM_FROM") or -1)
-ALARM_TO = int(os.getenv("ALARM_TO") or -1)
-# Заказ переводом: будить, когда клиент нажал «Я оплатил(а)» (paid) или сразу при заказе (order).
-# Наличные заказы будят всегда сразу.
-ALARM_TRANSFER_WHEN = os.getenv("ALARM_TRANSFER_WHEN", "paid").strip().lower()
 SUPPORT_MIN_GAP = int(os.getenv("SUPPORT_MIN_GAP", "10"))  # пауза между сообщениями в поддержку, сек
 
 # Стартовый ассортимент для НОВОЙ базы: (название, цена, остаток, описание, закупка).
@@ -385,7 +363,6 @@ def init_db():
         ensure_column(c, "products", "sale_price", "INTEGER")  # цена по акции (NULL — нет акции)
         ensure_column(c, "orders", "promo_code", "TEXT")
         ensure_column(c, "orders", "discount", "INTEGER NOT NULL DEFAULT 0")
-        ensure_column(c, "orders", "fee", "INTEGER NOT NULL DEFAULT 0")  # доплата за малый заказ
         # reminded: 0 — нет, 1 — напомнили об оплате, 2 — продавец сказал «оплаты нет», не отменять само
         ensure_column(c, "orders", "reminded", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(c, "promocodes", "owner_id", "INTEGER")  # личный промокод (приведи друга)
@@ -599,15 +576,8 @@ def promo_discount(c, code, user_id, subtotal):
     return d, None
 
 
-def small_order_fee(subtotal):
-    """Доплата за заказ меньше MIN_ORDER (считается от суммы товаров ДО промокода)."""
-    if MIN_ORDER > 0 and SMALL_ORDER_FEE > 0 and 0 < subtotal < MIN_ORDER:
-        return SMALL_ORDER_FEE
-    return 0
-
-
 def cart_totals(user_id):
-    """(товары, сумма, скидка, итого, промокод, ошибка_промокода). Итого уже включает доплату за малый заказ."""
+    """(товары, сумма, скидка, итого, промокод, ошибка_промокода)."""
     items = cart_items(user_id)
     subtotal = sum(eff_price(i["price"]) * i["qty"] for i in items)
     code = err = None
@@ -620,7 +590,7 @@ def cart_totals(user_id):
                 c.execute("DELETE FROM cart_promos WHERE user_id=?", (user_id,))
             else:
                 code, discount = row["code"], d
-    return items, subtotal, discount, subtotal - discount + small_order_fee(subtotal), code, err
+    return items, subtotal, discount, subtotal - discount, code, err
 
 
 # ── Поиск ──
@@ -744,14 +714,13 @@ def place_order(user, payment):
                 c.execute("DELETE FROM cart_promos WHERE user_id=?", (user.id,))
                 return None, f"Промокод больше не действует: {perr} Проверьте корзину и оформите заказ ещё раз."
             discount, code = d, prow["code"]
-        fee = small_order_fee(subtotal)
-        total = subtotal - discount + fee
+        total = subtotal - discount
         for i in items:
             c.execute("UPDATE products SET stock = stock - ? WHERE id=?", (i["qty"], i["id"]))
         cur = c.execute(
             """INSERT INTO orders(user_id, username, full_name, room, payment, total,
-                                  items_json, created_at, promo_code, discount, fee)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                                  items_json, created_at, promo_code, discount)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
             (
                 user.id,
                 user.username,
@@ -763,7 +732,6 @@ def place_order(user, payment):
                 now.strftime("%Y-%m-%d %H:%M:%S"),
                 code,
                 discount,
-                fee,
             ),
         )
         if code:
@@ -1052,8 +1020,8 @@ def users_csv_bytes():
 
 
 # ── Приведи друга ──
-def make_personal_promo(user_id, amount=0, percent=0):
-    """Одноразовый промокод (percent % — приоритетнее, иначе amount ₽), который сможет применить только user_id."""
+def make_personal_promo(user_id, amount):
+    """Одноразовый промокод на amount ₽, который сможет применить только user_id."""
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     with db() as c:
         while True:
@@ -1062,7 +1030,7 @@ def make_personal_promo(user_id, amount=0, percent=0):
                 break
         c.execute(
             "INSERT INTO promocodes(code, percent, amount, max_uses, used, owner_id) VALUES(?,?,?,?,?,?)",
-            (code, percent, 0 if percent else amount, 1, 0, user_id),
+            (code, 0, amount, 1, 0, user_id),
         )
     return code
 
@@ -1070,13 +1038,13 @@ def make_personal_promo(user_id, amount=0, percent=0):
 def referral_reward(o):
     """Вызывать, когда заказ o выдан. Если это первый зачётный заказ приглашённого —
     создаёт награду пригласившему и возвращает (referrer_id, промокод), иначе None."""
-    if not REF_REWARD_ON:
+    if REF_REWARD_AMOUNT <= 0:
         return None
     with db() as c:
         u = c.execute(
             "SELECT referrer_id, ref_rewarded FROM users WHERE user_id=?", (o["user_id"],)
         ).fetchone()
-        if not u or not u["referrer_id"] or u["ref_rewarded"] or o["total"] - (o["fee"] or 0) < REF_MIN_TOTAL:
+        if not u or not u["referrer_id"] or u["ref_rewarded"] or o["total"] < REF_MIN_TOTAL:
             return None
         if REF_MAX_REWARDS > 0:
             n = c.execute(
@@ -1086,7 +1054,7 @@ def referral_reward(o):
                 return None
         c.execute("UPDATE users SET ref_rewarded=1 WHERE user_id=?", (o["user_id"],))
         rid = u["referrer_id"]
-    return rid, make_personal_promo(rid, REF_REWARD_AMOUNT, REF_REWARD_PERCENT)
+    return rid, make_personal_promo(rid, REF_REWARD_AMOUNT)
 
 
 def ref_link(user_id):
@@ -1095,7 +1063,7 @@ def ref_link(user_id):
 
 
 def friend_card(user_id):
-    if not REF_FRIEND_ON and not REF_REWARD_ON:
+    if REF_FRIEND_AMOUNT <= 0 and REF_REWARD_AMOUNT <= 0:
         return "🎁 Программа «Приведи друга» сейчас отключена.", None
     with db() as c:
         invited = c.execute("SELECT COUNT(*) FROM users WHERE referrer_id=?", (user_id,)).fetchone()[0]
@@ -1103,16 +1071,16 @@ def friend_card(user_id):
             "SELECT COUNT(*) FROM users WHERE referrer_id=? AND ref_rewarded=1", (user_id,)
         ).fetchone()[0]
         codes = c.execute(
-            "SELECT code, amount, percent FROM promocodes WHERE owner_id=? AND (max_uses IS NULL OR used < max_uses) "
+            "SELECT code, amount FROM promocodes WHERE owner_id=? AND (max_uses IS NULL OR used < max_uses) "
             "ORDER BY rowid", (user_id,),
         ).fetchall()
     link = ref_link(user_id)
     out = ["🎁 <b>Приведи друга</b>", ""]
-    if REF_FRIEND_ON:
-        out.append(f"Друг, который придёт по вашей ссылке, получит <b>−{REF_FRIEND_TEXT}</b> на первый заказ.")
-    if REF_REWARD_ON:
+    if REF_FRIEND_AMOUNT > 0:
+        out.append(f"Друг, который придёт по вашей ссылке, получит <b>−{REF_FRIEND_AMOUNT} ₽</b> на первый заказ.")
+    if REF_REWARD_AMOUNT > 0:
         out.append(
-            f"А вы — <b>−{REF_REWARD_TEXT}</b> на заказ, когда его первый заказ "
+            f"А вы — <b>−{REF_REWARD_AMOUNT} ₽</b> на заказ, когда его первый заказ "
             f"(от {REF_MIN_TOTAL} ₽) будет выдан."
         )
     out.append("")
@@ -1121,7 +1089,7 @@ def friend_card(user_id):
     if codes:
         out.append("\n🎟 <b>Ваши промокоды</b> (одноразовые, личные):")
         for r in codes:
-            out.append(f"<code>{r['code']}</code> — −" + (f"{r['percent']}%" if r["percent"] else f"{r['amount']} ₽"))
+            out.append(f"<code>{r['code']}</code> — −{r['amount']} ₽")
         out.append("Применить: «🏷 Ввести промокод» в корзине или /promo КОД")
     kb = None
     if link:
@@ -1381,35 +1349,10 @@ def shift_window(now):
     return start, start + timedelta(hours=24 - OPEN_HOUR + CLOSE_HOUR)
 
 
-WEEKDAYS = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
-PKEY_RE = re.compile(r"^([nd]):(\d{8})$")
-
-
-def norm_key(key, now=None):
-    """«night» и «today» → ключи с датой; остальные ключи без изменений."""
-    now = now or datetime.now(ZoneInfo(TZ))
-    if key == "night":
-        return "n:" + shift_window(now)[0].strftime("%Y%m%d")
-    if key == "today":
-        return "d:" + now.strftime("%Y%m%d")
-    return key
-
-
 def stats_period(key, now=None):
     """Возвращает (start, end, подпись); start/end — строки в формате БД или None."""
     now = now or datetime.now(ZoneInfo(TZ))
     fmt = "%Y-%m-%d %H:%M:%S"
-    mm = PKEY_RE.match(key or "")
-    if mm:  # n:ГГГГММДД — ночь, начавшаяся в этот день; d:ГГГГММДД — календарный день
-        d = datetime.strptime(mm.group(2), "%Y%m%d").date()
-        if mm.group(1) == "n":
-            start = datetime(d.year, d.month, d.day, OPEN_HOUR, 0, tzinfo=ZoneInfo(TZ))
-            end = start + timedelta(hours=24 - OPEN_HOUR + CLOSE_HOUR)
-            live = " (идёт сейчас)" if start <= now < end else ""
-            return start.strftime(fmt), end.strftime(fmt), f"🌙 ночь {start:%d.%m} → {end:%d.%m}{live}"
-        start = datetime(d.year, d.month, d.day, tzinfo=ZoneInfo(TZ))
-        name = {0: "сегодня", -1: "вчера", -2: "позавчера"}.get((d - now.date()).days, WEEKDAYS[d.weekday()])
-        return start.strftime(fmt), (start + timedelta(days=1)).strftime(fmt), f"📅 {name}, {d:%d.%m}"
     if key == "night":
         start, end = shift_window(now)
         live = " (идёт сейчас)" if start <= now < end else ""
@@ -1463,9 +1406,8 @@ def compute_stats(start=None, end=None):
             if o["status"] == "done":
                 profit += gain
 
-    for o in done:  # промокод уменьшает выручку (и прибыль), доплата за малый заказ — наоборот
+    for o in done:  # промокод уменьшает выручку, а значит и прибыль
         profit -= o["discount"] or 0
-        profit += o["fee"] or 0
 
     buyers = Counter(o["user_id"] for o in live)
     unpaid = [o for o in active if o["payment"] == "transfer" and o["pay_status"] != "paid"]
@@ -1555,155 +1497,6 @@ def stats_kb(active):
         kb.button(text=("• " if key == active else "") + label, callback_data=f"st:{key}")
     kb.adjust(2)
     return kb.as_markup()
-# ── Рекап: один экран с переключателями (ночь / день / неделя / месяц), листанием и списком заказов ──
-def recap_text(key="night"):
-    now = datetime.now(ZoneInfo(TZ))
-    key = norm_key(key, now)
-    start, end, _ = stats_period(key, now)
-    d = compute_stats(start, end)
-    head, _, rest = stats_text(key).replace("📈 <b>Статистика — ", "🌅 <b>Рекап — ", 1).partition("\n\n")
-    quick = ""
-    if d["orders"] or d["cancelled"]:
-        quick = f"⚡ {d['orders']} зак. · выдано {d['done']} · 💰 {rub(d['revenue'])} · 📊 {rub(d['profit'])}"
-        mm = PKEY_RE.match(key)
-        if mm:  # сравнение с предыдущей ночью / днём
-            prev = datetime.strptime(mm.group(2), "%Y%m%d").date() - timedelta(days=1)
-            ps, pe, _ = stats_period(f"{mm.group(1)}:{prev:%Y%m%d}", now)
-            pd = compute_stats(ps, pe)
-            if pd["orders"]:
-                diff = d["revenue"] - pd["revenue"]
-                what = "прошлой ночью" if mm.group(1) == "n" else "предыдущим днём"
-                quick += (
-                    f"\n{'📈' if diff >= 0 else '📉'} по сравнению с {what}: "
-                    f"{'+' if diff >= 0 else '−'}{rub(abs(diff))} выручки (тогда {pd['orders']} зак.)"
-                )
-        quick += "\n\n"
-    return head + "\n\n" + quick + rest
-
-
-def recap_kb(key="night"):
-    now = datetime.now(ZoneInfo(TZ))
-    key = norm_key(key, now)
-    mm = PKEY_RE.match(key)
-    cur = datetime.strptime(mm.group(2), "%Y%m%d").date() if mm else None
-    kb = InlineKeyboardBuilder()
-
-    def btn(label, k, on):
-        kb.button(text=("• " if on else "") + label, callback_data=f"rc:{k}")
-
-    btn("🌙 Ночь", "n:" + (cur or shift_window(now)[0].date()).strftime("%Y%m%d"), bool(mm) and mm.group(1) == "n")
-    btn("📅 День", "d:" + (cur or now.date()).strftime("%Y%m%d"), bool(mm) and mm.group(1) == "d")
-    btn("7 дней", "7", key == "7")
-    btn("30 дней", "30", key == "30")
-    btn("Всё время", "all", key == "all")
-    sizes = [2, 3]
-    if mm:  # листание: ◀️ раньше / позже ▶️
-        latest = shift_window(now)[0].date() if mm.group(1) == "n" else now.date()
-        kb.button(text="◀️ Раньше", callback_data=f"rc:{mm.group(1)}:{(cur - timedelta(days=1)):%Y%m%d}")
-        sizes.append(1)
-        if cur < latest:
-            kb.button(text="Позже ▶️", callback_data=f"rc:{mm.group(1)}:{(cur + timedelta(days=1)):%Y%m%d}")
-            sizes[-1] = 2
-    kb.button(text="📋 Заказы", callback_data=f"rcl:{key}")
-    kb.button(text="📥 Таблица", callback_data=f"rcx:{key}")
-    kb.button(text="🔄", callback_data=f"rc:{key}")
-    sizes.append(3)
-    kb.adjust(*sizes)
-    return kb.as_markup()
-
-
-def orders_in_period(start, end):
-    q, params = "SELECT * FROM orders WHERE 1=1", []
-    if start:
-        q += " AND created_at >= ?"
-        params.append(start)
-    if end:
-        q += " AND created_at < ?"
-        params.append(end)
-    with db() as c:
-        return c.execute(q + " ORDER BY id", params).fetchall()
-
-
-def recap_orders_text(key):
-    key = norm_key(key)
-    start, end, label = stats_period(key)
-    rows = orders_in_period(start, end)
-    if not rows:
-        return f"📋 {label}: заказов нет."
-    lines = [f"📋 <b>Заказы — {label}</b> ({len(rows)})", ""]
-    for o in rows[-30:]:
-        pay = "💵" if o["payment"] == "cash" else ("💸✅" if o["pay_status"] == "paid" else "💸⏳")
-        lines.append(
-            f"{STATUS_ICONS[o['status']]} <b>#{o['id']}</b> {o['created_at'][11:16]} · {o['total']} ₽ · {pay} · "
-            f"{html.escape(o['room'] or '—')} · {html.escape(o['full_name'] or '—')}"
-        )
-    if len(rows) > 30:
-        lines.append(f"…показаны последние 30 из {len(rows)} — все в «📥 Таблица»")
-    lines.append("\n💵 наличные · 💸✅ перевод получен · 💸⏳ ждём перевод. Заказ целиком: /orders")
-    return "\n".join(lines)
-
-
-def recap_csv_bytes(key):
-    key = norm_key(key)
-    start, end, _ = stats_period(key)
-    buf = io.StringIO()
-    w = csv.writer(buf, delimiter=";")
-    w.writerow(["№", "Дата и время", "Клиент", "Username", "Комната", "Оплата", "Оплата получена",
-                "Статус", "Состав", "Промокод", "Скидка, ₽", "Доплата, ₽", "Сумма, ₽"])
-    for o in orders_in_period(start, end):
-        items = "; ".join(f"{i['name']} × {i['qty']}" for i in json.loads(o["items_json"]))
-        w.writerow([
-            o["id"], o["created_at"], o["full_name"] or "", o["username"] or "", o["room"] or "",
-            PAY_LABELS.get(o["payment"], o["payment"]), "да" if o["pay_status"] == "paid" else "нет",
-            STATUS_LABELS.get(o["status"], o["status"]), items, o["promo_code"] or "",
-            o["discount"] or 0, o["fee"] or 0, o["total"],
-        ])
-    return buf.getvalue().encode("utf-8-sig")
-
-
-def recap_key_from_text(arg):
-    """Ключ периода из слов команды: /recap вчера, /recap 12.11, /recap день 12.11 … None — не понял."""
-    a = " ".join((arg or "").lower().replace("ё", "е").split())
-    now = datetime.now(ZoneInfo(TZ))
-    night = shift_window(now)[0].date()
-    if a in ("", "ночь", "эта ночь", "сейчас", "night"):
-        return "night"
-    if a in ("прошлая", "прошлая ночь", "вчерашняя ночь", "прошлую ночь"):
-        return f"n:{night - timedelta(days=1):%Y%m%d}"
-    if a in ("сегодня", "день", "today"):
-        return "today"
-    if a == "вчера":
-        return f"d:{now.date() - timedelta(days=1):%Y%m%d}"
-    if a == "позавчера":
-        return f"d:{now.date() - timedelta(days=2):%Y%m%d}"
-    if a in ("7", "неделя", "недели", "за неделю"):
-        return "7"
-    if a in ("30", "месяц", "за месяц"):
-        return "30"
-    if a in ("все", "всё", "все время", "всё время", "all"):
-        return "all"
-    m = re.fullmatch(r"(?:(ночь|день)\s+)?(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?", a)
-    if m:
-        year = int(m.group(4)) if m.group(4) else now.year
-        year += 2000 if year < 100 else 0
-        try:
-            day = datetime(year, int(m.group(3)), int(m.group(2))).date()
-        except ValueError:
-            return None
-        if not m.group(4) and day > now.date():
-            day = day.replace(year=year - 1)  # «25.12» в ноябре — это прошлый год
-        return f"{'d' if m.group(1) == 'день' else 'n'}:{day:%Y%m%d}"
-    return None
-
-
-RECAP_USAGE = (
-    "🌅 <b>Рекап</b> — итоги за период, листать можно кнопками.\n"
-    "/recap — эта (или последняя) ночь\n"
-    "/recap прошлая — прошлая ночь · /recap сегодня · /recap вчера · /recap позавчера\n"
-    "/recap неделя · /recap месяц · /recap всё\n"
-    "/recap 12.11 — ночь, начавшаяся 12.11 · /recap день 12.11 — календарный день 12.11\n"
-    "(/report и /stats открывают то же самое)"
-)
 # ═══ STATS END ═════════════════════════════════════════════════════════
 
 
@@ -1855,19 +1648,9 @@ def build_cart(user_id):
     kb.button(text="✅ Оформить заказ", callback_data="checkout")
     kb.adjust(*([2] * len(items)), 2, 1, 1)
     text = "🛒 <b>Ваша корзина</b>\n\n" + "\n".join(lines)
-    fee = small_order_fee(subtotal)
-    if discount or fee:
-        text += f"\n\nСумма: {subtotal} ₽"
     if discount:
-        text += f"\n🏷 Промокод {html.escape(code)}: −{discount} ₽"
-    if fee:
-        text += f"\n📦 Доплата за малый заказ: +{fee} ₽"
+        text += f"\n\nСумма: {subtotal} ₽\n🏷 Промокод {html.escape(code)}: −{discount} ₽"
     text += f"\n\n<b>Итого: {total} ₽</b>"
-    if fee:
-        text += (
-            f"\nℹ️ Минимальный заказ — {MIN_ORDER} ₽. Меньше тоже можно, но с доплатой {fee} ₽. "
-            f"Добавьте товаров ещё на {MIN_ORDER - subtotal} ₽ — и доплата не понадобится."
-        )
     if perr:
         text += f"\n⚠️ Промокод снят: {html.escape(perr)}"
     if surcharge_active():
@@ -2146,8 +1929,6 @@ async def c_checkout(cb: CallbackQuery):
     await cb.message.answer(
         f"Сумма заказа: <b>{total} ₽</b>"
         + (f" (промокод {html.escape(code)}: −{discount} ₽)" if discount else "")
-        + (f"\n📦 Включая доплату за малый заказ (меньше {MIN_ORDER} ₽): +{small_order_fee(subtotal)} ₽"
-           if small_order_fee(subtotal) else "")
         + "\nКак будете платить?",
         reply_markup=kb.as_markup(),
     )
@@ -2161,79 +1942,6 @@ async def notify_seller(text, kb=None):
         logging.exception(
             "Не удалось написать продавцу. Продавец должен нажать /start в боте продавца."
         )
-
-
-# ── Будильник (Pushover) ──
-_bg_tasks = set()
-
-
-def fire_and_forget(coro):
-    """Запустить корутину в фоне, не задерживая ответ боту."""
-    t = asyncio.create_task(coro)
-    _bg_tasks.add(t)
-    t.add_done_callback(_bg_tasks.discard)
-
-
-def alarm_configured():
-    return bool(PUSHOVER_TOKEN and PUSHOVER_USER)
-
-
-def alarm_active(now=None):
-    """Включён ли будильник сейчас (настроен и попадает в часы ALARM_FROM–ALARM_TO)."""
-    if not alarm_configured():
-        return False
-    if ALARM_FROM < 0 or ALARM_TO < 0 or ALARM_FROM == ALARM_TO:
-        return True
-    h = (now or datetime.now(ZoneInfo(TZ))).hour
-    if ALARM_FROM < ALARM_TO:
-        return ALARM_FROM <= h < ALARM_TO
-    return h >= ALARM_FROM or h < ALARM_TO  # окно через полночь
-
-
-def _pushover_call(path, data):
-    req = urllib.request.Request(
-        "https://api.pushover.net/1/" + path, data=urlencode(data).encode("utf-8"), method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Pushover ответил {e.code}: {e.read().decode('utf-8', 'replace')[:200]}") from None
-
-
-async def alarm_send(oid, title, message, retry, expire):
-    data = {
-        "token": PUSHOVER_TOKEN, "user": PUSHOVER_USER, "title": title[:250], "message": message[:1000],
-        "priority": 2, "retry": retry, "expire": expire, "sound": ALARM_SOUND,
-        "tags": f"order{oid}",  # по тегу сигнал можно остановить, не храня номер квитанции
-    }
-    return await asyncio.to_thread(_pushover_call, "messages.json", data)
-
-
-async def alarm_new_order(o):
-    """Поднять продавца будильником из-за заказа o (строка из orders)."""
-    if not alarm_active():
-        return
-    items = json.loads(o["items_json"])
-    names = ", ".join(f"{i['name']} ×{i['qty']}" for i in items)
-    msg = (
-        f"{names}\nОплата: {PAY_LABELS.get(o['payment'], o['payment'])}\n"
-        "Откройте Telegram → бот продавца → «Собран»."
-    )
-    try:
-        await alarm_send(o["id"], f"Заказ #{o['id']} — {o['total']} ₽", msg, ALARM_RETRY, ALARM_EXPIRE)
-    except Exception:
-        logging.exception("Pushover: не удалось отправить будильник")
-
-
-async def alarm_cancel(oid):
-    """Остановить повторы будильника по заказу (продавец отреагировал или заказ отменился)."""
-    if not alarm_configured():
-        return
-    try:
-        await asyncio.to_thread(_pushover_call, f"receipts/cancel_by_tag/order{oid}.json", {"token": PUSHOVER_TOKEN})
-    except Exception:
-        logging.warning("Pushover: не удалось остановить будильник по заказу #%s", oid)
 
 
 @customer_router.callback_query(F.data.startswith("pay:"))
@@ -2253,14 +1961,10 @@ async def c_pay(cb: CallbackQuery):
         await cb.answer()
         return
     oid, items, total, discount, code, low = result
-    o = get_order(oid)
-    fee = o["fee"] or 0
 
     msg = f"✅ <b>Заказ #{oid} принят!</b>\nСумма: <b>{total} ₽</b>."
     if discount:
         msg += f"\n🏷 Промокод {html.escape(code)}: −{discount} ₽"
-    if fee:
-        msg += f"\n📦 В сумму входит доплата за малый заказ (меньше {MIN_ORDER} ₽): +{fee} ₽"
     kb = None
     if payment == "transfer":
         msg += (
@@ -2281,9 +1985,8 @@ async def c_pay(cb: CallbackQuery):
     await cb.message.edit_text(msg, reply_markup=kb)
     await cb.answer()
 
+    o = get_order(oid)
     await notify_seller(admin_order_text(o), admin_order_kb(o))
-    if payment == "cash" or ALARM_TRANSFER_WHEN == "order":
-        fire_and_forget(alarm_new_order(o))
     for name, sku, stock in low:
         await notify_seller(
             f"⚠️ <b>{'Закончился' if stock <= 0 else 'Заканчивается'}:</b> {html.escape(name)} "
@@ -2320,8 +2023,6 @@ async def c_paid(cb: CallbackQuery):
     )
     o = get_order(oid)
     await notify_seller("🔔 <b>Клиент сообщил об оплате</b>\n\n" + admin_order_text(o), admin_order_kb(o))
-    if ALARM_TRANSFER_WHEN != "order":
-        fire_and_forget(alarm_new_order(o))
 
 
 # ── Предложения покупателей ──
@@ -2494,19 +2195,19 @@ async def welcome_referred(user):
         u = c.execute("SELECT referrer_id FROM users WHERE user_id=?", (user.id,)).fetchone()
     if not u or not u["referrer_id"]:
         return
-    if REF_FRIEND_ON:
-        code = make_personal_promo(user.id, REF_FRIEND_AMOUNT, REF_FRIEND_PERCENT)
+    if REF_FRIEND_AMOUNT > 0:
+        code = make_personal_promo(user.id, REF_FRIEND_AMOUNT)
         await tell_customer(
             user.id,
             f"🎁 Вас пригласил друг! Промокод на первый заказ: <code>{code}</code> — "
-            f"<b>−{REF_FRIEND_TEXT}</b>.\nПримените его в корзине («🏷 Ввести промокод») или командой "
+            f"<b>−{REF_FRIEND_AMOUNT} ₽</b>.\nПримените его в корзине («🏷 Ввести промокод») или командой "
             f"<code>/promo {code}</code>",
         )
-    if REF_REWARD_ON:
+    if REF_REWARD_AMOUNT > 0:
         await tell_customer(
             u["referrer_id"],
             f"👋 По вашей ссылке в магазин пришёл(а) {html.escape(user.full_name)}. Как только первый заказ "
-            f"друга (от {REF_MIN_TOTAL} ₽) будет выдан, вы получите промокод на −{REF_REWARD_TEXT}.",
+            f"друга (от {REF_MIN_TOTAL} ₽) будет выдан, вы получите промокод на −{REF_REWARD_AMOUNT} ₽.",
         )
 
 
@@ -2754,7 +2455,6 @@ def admin_order_text(o):
         f"Сумма: <b>{o['total']} ₽</b>"
         + (f" 🌙 (ночной тариф +{SURCHARGE_PERCENT}%)" if surcharged else "")
         + (f"\n🏷 Промокод {html.escape(o['promo_code'])}: −{o['discount']} ₽" if o["promo_code"] else "")
-        + (f"\n📦 Доплата за малый заказ: +{o['fee']} ₽" if o["fee"] else "")
         + "\n"
         f"Оплата: {pay_line(o)}\n"
         f"{room_line}\n"
@@ -2840,15 +2540,10 @@ def receipt_body(o):
         else:
             cost_sum += cost * i["qty"]
     out.append(sep)
-    has_promo = bool(o["promo_code"] and (o["discount"] or 0))
-    fee = o["fee"] or 0
-    if has_promo or fee:
+    if o["promo_code"] and (o["discount"] or 0):
         out.append(_receipt_row("Сумма", rub(subtotal)))
-    if has_promo:
         out += _receipt_wrap(f"Промокод {o['promo_code']}", "  ")
         out.append(_receipt_row("  скидка", "−" + rub(o["discount"])))
-    if fee:
-        out.append(_receipt_row(f"Доплата (заказ < {MIN_ORDER} ₽)", "+" + rub(fee)))
     out.append(_receipt_row("ИТОГО", rub(o["total"])))
     if any(i.get("base_price", i["price"]) != i["price"] for i in items):
         out.append(f"(ночной тариф +{SURCHARGE_PERCENT}% в ценах)")
@@ -2896,11 +2591,10 @@ SELLER_HELP = (
     "Заказы приходят сюда. Оплату переводом подтверждаете кнопкой «Оплата получена».\n\n"
     "/orders — активные заказы (у каждого есть кнопка «🧾 Чек»)\n"
     "/receipt [№] — чек по заказу (без номера — последнего)\n"
-    "/alarmtest — проверить будильник (звонок на телефон при заказе)\n"
-    "/recap — рекап: ночь / день / 7 / 30 дней / всё время, листание кнопками, список и таблица заказов. "
-    "Можно словами: /recap вчера, /recap прошлая, /recap неделя, /recap 12.11\n"
+    "/stats — статистика (ночь / 7 / 30 дней / всё время), с прибылью\n"
     "/suggestions — предложения покупателей\n"
     "/stock — товары, артикулы, остатки\n"
+    "/nal — ⚡ быстрое наличие: кнопки (телефон) или список «товар число» (компьютер), /nal help — справка\n"
     "/setprice id цена [id цена …]\n"
     "/setstock id кол-во [id кол-во …]\n"
     "/setcost id закупка [id закупка …] — закупочная цена (для прибыли), можно 21.9\n"
@@ -2925,7 +2619,7 @@ SELLER_HELP = (
     "/closeshop [сообщение] и /openshop — закрыть/открыть магазин вручную\n\n"
     "🧺 <b>Смена</b>\n"
     "/pick — сборочный лист (что собрать по новым заказам)\n"
-    "(/report и /stats — то же самое; рекап за ночь приходит сам после смены)\n"
+    "/report — отчёт за ночь (он же приходит сам после смены)\n"
     "/backup — резервная копия сейчас (раз в сутки приходит сама), /restore — как восстановить\n"
     "/soldout hide|show — прятать или показывать закончившиеся товары\n\n"
     "👥 <b>Люди и общение</b>\n"
@@ -2962,7 +2656,7 @@ def stock_text():
         f"\n\n🌙 Указаны обычные цены. С {SURCHARGE_FROM:02d}:00 до {SURCHARGE_TO:02d}:00 "
         f"покупатели видят +{SURCHARGE_PERCENT}%."
     )
-    return "<b>Склад</b> (id. [артикул] название)\n" + "\n".join(lines) + note
+    return "<b>Склад</b> (id. [артикул] название)\n" + "\n".join(lines) + note + "\n⚡ Быстро поменять остатки: /nal"
 
 
 async def send_orders(message: Message):
@@ -2982,6 +2676,7 @@ def panel_kb():
     kb.button(text="📋 Заказы", callback_data="s:orders")
     kb.button(text="📈 Статистика", callback_data="s:stats")
     kb.button(text="📦 Склад", callback_data="s:stock")
+    kb.button(text="⚡ Наличие", callback_data="s:nal")
     kb.button(text="💡 Предложения", callback_data="s:sug")
     kb.button(text="🧺 Сборка", callback_data="s:pick")
     kb.button(text="👥 Пользователи", callback_data="s:users")
@@ -3004,14 +2699,17 @@ async def s_cancel(m: Message, state: FSMContext):
     await m.answer("Отменено.")
 
 
-@seller_router.callback_query(F.data.in_({"s:orders", "s:stock", "s:stats", "s:sug", "s:pick", "s:users", "s:tickets"}))
+@seller_router.callback_query(F.data.in_({"s:orders", "s:stock", "s:nal", "s:stats", "s:sug", "s:pick", "s:users", "s:tickets"}))
 async def s_panel(cb: CallbackQuery):
     if cb.data == "s:orders":
         await send_orders(cb.message)
     elif cb.data == "s:stock":
         await cb.message.answer(stock_text())
+    elif cb.data == "s:nal":
+        text, kb = nal_list(0)
+        await cb.message.answer(text, reply_markup=kb)
     elif cb.data == "s:stats":
-        await cb.message.answer(recap_text("night"), reply_markup=recap_kb("night"))
+        await cb.message.answer(stats_text("night"), reply_markup=stats_kb("night"))
     elif cb.data == "s:pick":
         await cb.message.answer(pick_list_text())
     elif cb.data == "s:users":
@@ -3031,7 +2729,6 @@ async def s_order_action(cb: CallbackQuery, state: FSMContext):
     if not o:
         await cb.answer("Заказ не найден", show_alert=True)
         return
-    fire_and_forget(alarm_cancel(oid))  # продавец проснулся и занялся заказом — гасим будильник
     if o["status"] not in ACTIVE_STATUSES:
         await cb.answer("Заказ уже обработан", show_alert=True)
         return
@@ -3090,28 +2787,9 @@ async def s_order_action(cb: CallbackQuery, state: FSMContext):
             await tell_customer(
                 rid,
                 f"🎉 Ваш друг сделал первый заказ! Подарок вам: промокод <code>{code}</code> — "
-                f"<b>−{REF_REWARD_TEXT}</b> на любой заказ (/promo {code}).",
+                f"<b>−{REF_REWARD_AMOUNT} ₽</b> на любой заказ (/promo {code}).",
             )
             await cb.message.answer(f"🎁 «Приведи друга»: клиент {rid} получил промокод {code}.")
-
-
-@seller_router.message(Command("alarmtest"))
-async def s_alarmtest(m: Message):
-    if not alarm_configured():
-        await m.answer(
-            "🔔 Будильник не настроен.\nВ .env нужны PUSHOVER_TOKEN и PUSHOVER_USER "
-            "(приложение Pushover на iPhone + ключи с pushover.net), затем перезапустите бота."
-        )
-        return
-    try:
-        await alarm_send(0, "Проверка будильника", "Если вы это слышите — всё настроено. Нажмите «Acknowledge».", 30, 60)
-    except Exception as e:
-        await m.answer(f"❌ Не получилось отправить: {html.escape(str(e))[:300]}")
-        return
-    await m.answer(
-        "🔔 Тестовый сигнал отправлен — на iPhone должен зазвучать будильник. "
-        "Если тишина, проверьте настройки из инструкции (Фокусирование, «Критические уведомления» в Pushover)."
-    )
 
 
 @seller_router.callback_query(F.data.startswith("rcpt:"))
@@ -3385,41 +3063,9 @@ async def s_pick(m: Message):
 
 
 # ── Отчёт, резервная копия, закончившиеся товары ──
-@seller_router.message(Command("recap", "report", "stats"))
-async def s_recap(m: Message):
-    key = recap_key_from_text(m.text.partition(" ")[2])
-    if key is None:
-        await m.answer("Не понял период.\n\n" + RECAP_USAGE)
-        return
-    await m.answer(recap_text(key), reply_markup=recap_kb(key))
-
-
-@seller_router.callback_query(F.data.startswith("rc:"))
-async def s_recap_cb(cb: CallbackQuery):
-    key = cb.data[3:]
-    if key not in ("7", "30", "all") and not PKEY_RE.match(key):
-        await cb.answer()
-        return
-    await safe_edit(cb.message, recap_text(key), recap_kb(key))
-    await cb.answer("Обновлено")
-
-
-@seller_router.callback_query(F.data.startswith("rcl:"))
-async def s_recap_list(cb: CallbackQuery):
-    await cb.message.answer(recap_orders_text(cb.data[4:]))
-    await cb.answer()
-
-
-@seller_router.callback_query(F.data.startswith("rcx:"))
-async def s_recap_csv(cb: CallbackQuery):
-    key = norm_key(cb.data[4:])
-    _, _, label = stats_period(key)
-    stamp = re.sub(r"[^0-9A-Za-z]+", "_", key)
-    await cb.message.answer_document(
-        BufferedInputFile(recap_csv_bytes(key), filename=f"orders_{stamp}.csv"),
-        caption=f"📥 Заказы — {label}. Откройте в Excel.",
-    )
-    await cb.answer()
+@seller_router.message(Command("report"))
+async def s_report(m: Message):
+    await m.answer("🌅 <b>Отчёт</b>\n\n" + stats_text("night"), reply_markup=stats_kb("night"))
 
 
 async def send_backup(bot, caption_prefix="💾 Резервная копия"):
@@ -3898,13 +3544,18 @@ async def s_import_file(m: Message):
 
 
 # ── Статистика ──
+@seller_router.message(Command("stats"))
+async def s_stats(m: Message):
+    await m.answer(stats_text("night"), reply_markup=stats_kb("night"))
+
+
 @seller_router.callback_query(F.data.startswith("st:"))
 async def s_stats_cb(cb: CallbackQuery):
     key = cb.data.split(":")[1]
     if key not in ("night", "7", "30", "all"):
         await cb.answer()
         return
-    await safe_edit(cb.message, recap_text(key), recap_kb(key))
+    await safe_edit(cb.message, stats_text(key), stats_kb(key))
     await cb.answer()
 
 
@@ -4251,6 +3902,391 @@ async def s_bc_go(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
+# ═══ QUICK STOCK PURE BEGIN ═════════ Быстрое наличие: разбор и применение ═════════
+NAL_ZERO_WORDS = {
+    "нет", "нету", "ноль", "конец", "out",
+    "закончился", "закончилась", "закончилось", "кончился", "кончилась", "кончилось",
+}
+NAL_VALUE_RE = re.compile(r"^([+\-=−])?(\d{1,5})$")
+NAL_SEPARATORS = {":", "=", "—", "–", "-", "−"}
+
+
+def nal_icon(stock):
+    return "🔴" if stock <= 0 else ("🟡" if stock <= 2 else "🟢")
+
+
+def nal_norm(s):
+    s = s.lower().replace("ё", "е")
+    return " ".join(re.sub(r"[^\w\s]", "", s).split())
+
+
+def nal_parse_value(token):
+    """'12' -> ('set',12); '+5' -> ('add',5); '-2' -> ('sub',2); 'нет' -> ('set',0); иначе None."""
+    t = token.strip().lower().rstrip(".,;!")
+    if t in NAL_ZERO_WORDS:
+        return ("set", 0)
+    m = NAL_VALUE_RE.match(t)
+    if not m:
+        return None
+    return ({"+": "add", "-": "sub", "−": "sub"}.get(m.group(1), "set"), int(m.group(2)))
+
+
+def nal_parse_line(line):
+    """'кола 9' / 'A002 +5' / 'Lays краб -2  # комментарий' -> (товар, действие, число) или None."""
+    line = line.split("#", 1)[0].strip()
+    toks = [t for t in line.split() if t not in NAL_SEPARATORS]
+    toks = [t[:-1] if len(t) > 1 and t.endswith(":") else t for t in toks]  # «A001:»
+    if len(toks) < 2:
+        return None
+    val = nal_parse_value(toks[-1])
+    if not val:
+        return None
+    return " ".join(toks[:-1]), val[0], val[1]
+
+
+def nal_find(c, ref):
+    """Ищет товар по артикулу, id, названию или его части. -> (строка, None) или (None, ошибка)."""
+    ref = ref.strip()
+    cols = "SELECT id, name, sku, stock FROM products "
+    r = c.execute(cols + "WHERE lower(sku)=lower(?)", (ref,)).fetchone()
+    if r:
+        return r, None
+    if ref.isdigit():
+        r = c.execute(cols + "WHERE id=?", (int(ref),)).fetchone()
+        if r:
+            return r, None
+    rows = c.execute(cols + "ORDER BY id").fetchall()
+    q = nal_norm(ref)
+    exact = [x for x in rows if nal_norm(x["name"]) == q]
+    if len(exact) == 1:
+        return exact[0], None
+    words = q.split()
+    found = [
+        x for x in rows
+        if words and all(w in nal_norm(x["name"] + " " + (x["sku"] or "")) for w in words)
+    ]
+    if len(found) == 1:
+        return found[0], None
+    if not found:
+        return None, "товар не найден"
+    opts = ", ".join(f"{html.escape(x['name'])} [{html.escape(x['sku'] or str(x['id']))}]" for x in found[:5])
+    return None, f"подходит несколько: {opts}. Уточните или используйте артикул"
+
+
+def nal_run_batch(body):
+    """Применяет строки «товар значение». Возвращает (строки_отчёта, undo, сколько_изменено)."""
+    report, undo, changed = [], [], 0
+    with db() as c:
+        for raw in re.split(r"[\n;]+", body):
+            raw = raw.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            parsed = nal_parse_line(raw)
+            if not parsed:
+                report.append(f"⚠️ «{html.escape(raw)}»: не понял, нужен формат «товар число»")
+                continue
+            ref, op, n = parsed
+            r, err = nal_find(c, ref)
+            if err:
+                report.append(f"⚠️ «{html.escape(raw)}»: {err}")
+                continue
+            # берём актуальный остаток (товар мог уже измениться выше в этом же списке)
+            old = c.execute("SELECT stock FROM products WHERE id=?", (r["id"],)).fetchone()["stock"]
+            note = ""
+            if op == "set":
+                new = n
+            elif op == "add":
+                new, note = old + n, f" (+{n})"
+            else:
+                new, note = old - n, f" (−{n})"
+                if new < 0:
+                    new, note = 0, note + " ⚠️ в минус не уходим"
+            name = html.escape(r["name"])
+            if new == old:
+                report.append(f"➖ {name}: уже {old}")
+                continue
+            c.execute("UPDATE products SET stock=? WHERE id=?", (new, r["id"]))
+            undo.append((r["id"], old, new))
+            changed += 1
+            report.append(f"✅ {name}: {old} → {new}{note}")
+    return report, undo, changed
+
+
+def nal_change(pid, delta=None, value=None):
+    """Меняет остаток одного товара. -> (название, было, стало) или None."""
+    with db() as c:
+        r = c.execute("SELECT name, stock FROM products WHERE id=?", (pid,)).fetchone()
+        if not r:
+            return None
+        new = max(value if value is not None else r["stock"] + delta, 0)
+        c.execute("UPDATE products SET stock=? WHERE id=?", (new, pid))
+    return r["name"], r["stock"], new
+
+
+def nal_undo_apply(entries):
+    """Откат пакета: возвращаем разницу, а не старое число (чтобы не затереть заказы, прошедшие после)."""
+    with db() as c:
+        for pid, old, new in entries:
+            c.execute("UPDATE products SET stock = MAX(stock + ?, 0) WHERE id=?", (old - new, pid))
+# ═══ QUICK STOCK PURE END ═════════════════════════════════════════════════════
+
+
+# ═══ QUICK STOCK UI BEGIN ═══════════ Быстрое наличие: кнопки и команда ═══════════
+class QuickStock(StatesGroup):
+    value = State()
+
+
+NAL_PAGE = 12
+nal_undo = {}  # токен -> [(pid, было, стало)] — для кнопки «Отменить это обновление»
+
+NAL_HELP = (
+    "⚡ <b>Быстрое наличие</b>\n\n"
+    "📱 <b>С телефона:</b> /nal — список товаров, нажмите на товар → кнопки −1 / +1 / +5 / +10, «0 — нет», "
+    "«✏️ Ввести число», стрелки ⬅️ ➡️ для перехода к соседним товарам.\n\n"
+    "💻 <b>С компьютера (списком):</b> отправьте /nal и под ним строки «товар число»:\n"
+    "<pre>/nal\n"
+    "кола 9\n"
+    "A002 +5\n"
+    "lays краб -2\n"
+    "роллтон говядина 0</pre>\n"
+    "• Товар — артикул, id или часть названия.\n"
+    "• <code>12</code> — поставить 12, <code>+5</code> — добавить, <code>-2</code> — убрать "
+    "(минус пишите слитно с числом), <code>0</code> или «нет» — закончился.\n"
+    "• Можно писать в одной строке /nal, а несколько товаров разделять переносом строки или «;».\n"
+    "• Кнопка «📝 Шаблон списком» присылает все товары с текущими остатками — скопируйте, поправьте числа "
+    "и отправьте обратно.\n"
+    "• После пакетного обновления есть кнопка «↩️ Отменить»."
+)
+
+
+def nal_rows():
+    with db() as c:
+        return c.execute("SELECT id, name, sku, stock, price, active FROM products ORDER BY id").fetchall()
+
+
+def nal_list(page=0):
+    rows = nal_rows()
+    pages = max(1, (len(rows) + NAL_PAGE - 1) // NAL_PAGE)
+    page = min(max(page, 0), pages - 1)
+    kb = InlineKeyboardBuilder()
+    for r in rows[page * NAL_PAGE:(page + 1) * NAL_PAGE]:
+        name = r["name"] if len(r["name"]) <= 30 else r["name"][:29] + "…"
+        hid = "🙈 " if not r["active"] else ""
+        kb.row(InlineKeyboardButton(
+            text=f"{nal_icon(r['stock'])} {hid}{name} · {r['stock']}", callback_data=f"nal:p:{r['id']}"
+        ))
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"nal:l:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="nal:noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"nal:l:{page + 1}"))
+        kb.row(*nav)
+    kb.row(
+        InlineKeyboardButton(text="📝 Шаблон списком", callback_data="nal:t"),
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"nal:l:{page}"),
+    )
+    out = sum(1 for r in rows if r["stock"] <= 0)
+    text = (
+        "⚡ <b>Быстрое наличие</b> — нажмите на товар, чтобы изменить остаток\n"
+        f"🟢 есть · 🟡 мало (1–2) · 🔴 нет · 🙈 скрыт\n"
+        f"Товаров: {len(rows)}, закончились: {out}\n"
+        "Списком с компьютера: /nal товар число (подробнее — /nal help)"
+    )
+    return text, kb.as_markup()
+
+
+def nal_card(pid):
+    with db() as c:
+        p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+        ids = [r["id"] for r in c.execute("SELECT id FROM products ORDER BY id")]
+        subs = c.execute("SELECT COUNT(*) FROM stock_subs WHERE product_id=?", (pid,)).fetchone()[0]
+    if not p:
+        return None
+    i = ids.index(pid)
+    text = (
+        f"📦 <b>{html.escape(p['name'])}</b> [{html.escape(p['sku'] or '-')}]\n"
+        f"Сейчас: <b>{p['stock']} шт.</b> {nal_icon(p['stock'])}\n"
+        f"Цена: {p['price']} ₽" + ("   🙈 скрыт" if not p["active"] else "")
+    )
+    if subs:
+        text += f"\n🔔 Ждут поступления: {subs} — получат уведомление, когда остаток станет больше 0"
+    kb = InlineKeyboardBuilder()
+    kb.row(*(
+        InlineKeyboardButton(text=t, callback_data=f"nal:d:{pid}:{d}")
+        for t, d in (("−5", -5), ("−1", -1), ("+1", 1), ("+5", 5))
+    ))
+    kb.row(*(
+        InlineKeyboardButton(text=t, callback_data=f"nal:d:{pid}:{d}")
+        for t, d in (("+10", 10), ("+20", 20), ("+50", 50))
+    ))
+    kb.row(
+        InlineKeyboardButton(text="0 — нет", callback_data=f"nal:z:{pid}"),
+        InlineKeyboardButton(text="✏️ Ввести число", callback_data=f"nal:e:{pid}"),
+    )
+    nav = []
+    if i > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"nal:p:{ids[i - 1]}"))
+    nav.append(InlineKeyboardButton(text="📋 К списку", callback_data=f"nal:l:{i // NAL_PAGE}"))
+    if i < len(ids) - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"nal:p:{ids[i + 1]}"))
+    kb.row(*nav)
+    return text, kb.as_markup()
+
+
+async def nal_send_long(m: Message, text, kb=None):
+    """Telegram режет сообщения длиннее ~4096 символов — делим по строкам."""
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > 3800:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    chunks.append(cur)
+    for n, ch in enumerate(chunks):
+        await m.answer(ch.rstrip(), reply_markup=kb if n == len(chunks) - 1 else None)
+
+
+async def nal_apply_text(m: Message, body):
+    report, undo, changed = nal_run_batch(body)
+    if not report:
+        await m.answer(NAL_HELP)
+        return
+    kb = None
+    if undo:
+        token = f"{random.randrange(16 ** 6):06x}"
+        nal_undo[token] = undo
+        while len(nal_undo) > 20:
+            nal_undo.pop(next(iter(nal_undo)))
+        b = InlineKeyboardBuilder()
+        b.button(text="↩️ Отменить это обновление", callback_data=f"nal:u:{token}")
+        kb = b.as_markup()
+    head = f"📦 <b>Наличие обновлено</b>: изменено {changed}\n"
+    await nal_send_long(m, head + "\n".join(report) + "\n\nПанель с кнопками: /nal", kb)
+
+
+@seller_router.message(Command("nal", "avail"))
+async def s_nal(m: Message, state: FSMContext):
+    parts = (m.text or "").split(None, 1)
+    body = parts[1].strip() if len(parts) > 1 else ""
+    if body.lower() in ("help", "?", "справка"):
+        await m.answer(NAL_HELP)
+    elif body:
+        await state.clear()
+        await nal_apply_text(m, body)
+    else:
+        await state.clear()
+        text, kb = nal_list(0)
+        await m.answer(text, reply_markup=kb)
+
+
+@seller_router.callback_query(F.data.startswith("nal:"))
+async def s_nal_cb(cb: CallbackQuery, state: FSMContext):
+    parts = cb.data.split(":")
+    act = parts[1]
+    if act == "noop":
+        await cb.answer()
+    elif act == "l":
+        text, kb = nal_list(int(parts[2]))
+        await safe_edit(cb.message, text, kb)
+        await cb.answer()
+    elif act == "p":
+        card = nal_card(int(parts[2]))
+        if not card:
+            await cb.answer("Товар не найден", show_alert=True)
+            return
+        await safe_edit(cb.message, *card)
+        await cb.answer()
+    elif act in ("d", "z"):
+        pid = int(parts[2])
+        res = nal_change(pid, value=0) if act == "z" else nal_change(pid, delta=int(parts[3]))
+        if not res:
+            await cb.answer("Товар не найден", show_alert=True)
+            return
+        name, old, new = res
+        card = nal_card(pid)
+        if card:
+            await safe_edit(cb.message, *card)
+        await cb.answer(f"{name}: {old} → {new}" if new != old else f"Уже {old}")
+    elif act == "e":
+        pid = int(parts[2])
+        with db() as c:
+            r = c.execute("SELECT name, stock FROM products WHERE id=?", (pid,)).fetchone()
+        if not r:
+            await cb.answer("Товар не найден", show_alert=True)
+            return
+        await state.set_state(QuickStock.value)
+        prompt = await cb.message.answer(
+            f"✏️ «{html.escape(r['name'])}»: сейчас {r['stock']}.\n"
+            "Напишите число: <code>12</code> — поставить, <code>+5</code> — добавить, <code>-2</code> — убрать.\n"
+            "Отмена — /cancel"
+        )
+        await state.update_data(pid=pid, msg_id=cb.message.message_id, prompt_id=prompt.message_id)
+        await cb.answer()
+    elif act == "t":
+        lines = [
+            f"{r['sku'] or r['id']} {r['stock']}   # {r['name']}"
+            for r in nal_rows()
+        ]
+        await cb.message.answer(
+            "📝 <b>Шаблон</b> — нажмите на блок, чтобы скопировать, поправьте числа и отправьте боту:"
+        )
+        for i in range(0, len(lines), 30):
+            block = "\n".join(lines[i:i + 30])
+            await cb.message.answer(f"<pre>/nal\n{html.escape(block)}</pre>")
+        await cb.answer()
+    elif act == "u":
+        entries = nal_undo.pop(parts[2], None)
+        if not entries:
+            await cb.answer("Уже отменено или устарело", show_alert=True)
+            return
+        nal_undo_apply(entries)
+        try:
+            await cb.message.edit_text(cb.message.html_text + "\n\n↩️ <b>Обновление отменено</b>", reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await cb.answer("Отменено")
+    else:
+        await cb.answer()
+
+
+@seller_router.message(QuickStock.value, F.text)
+async def s_nal_value(m: Message, state: FSMContext):
+    val = nal_parse_value(m.text or "")
+    if not val:
+        await m.answer("Нужно число: 12 — поставить, +5 — добавить, -2 — убрать. /cancel — отмена.")
+        return
+    data = await state.get_data()
+    pid = data.get("pid")
+    op, n = val
+    cur = nal_change(pid, delta=0)  # просто читаем текущий остаток
+    if not cur:
+        await state.clear()
+        await m.answer("Товар не найден.")
+        return
+    old = cur[1]
+    target = n if op == "set" else (old + n if op == "add" else old - n)
+    name, old, new = nal_change(pid, value=target)
+    await state.clear()
+    card = nal_card(pid)
+    if card and data.get("msg_id"):
+        try:
+            await m.bot.edit_message_text(
+                card[0], chat_id=m.chat.id, message_id=data["msg_id"], reply_markup=card[1]
+            )
+        except TelegramBadRequest:
+            pass
+    for mid in (m.message_id, data.get("prompt_id")):  # убираем лишнее из чата
+        if mid:
+            try:
+                await m.bot.delete_message(m.chat.id, mid)
+            except Exception:
+                pass
+    await m.answer(f"✅ {html.escape(name)}: {old} → {new}")
+# ═══ QUICK STOCK UI END ═══════════════════════════════════════════════════════
+
+
 # ── Все остальные в боте продавца ──
 @guest_router.message()
 async def g_message(m: Message):
@@ -4284,8 +4320,9 @@ CUSTOMER_COMMANDS = [
 SELLER_COMMANDS = [
     ("orders", "📋 Активные заказы"),
     ("receipt", "🧾 Чек по заказу"),
-    ("alarmtest", "🔔 Проверить будильник"),
+    ("stats", "📈 Статистика"),
     ("stock", "📦 Склад и остатки"),
+    ("nal", "⚡ Быстрое наличие"),
     ("suggestions", "💡 Предложения покупателей"),
     ("setprice", "💰 Изменить цену"),
     ("setstock", "🔢 Изменить остаток"),
@@ -4310,7 +4347,7 @@ SELLER_COMMANDS = [
     ("users", "👥 Пользователи бота"),
     ("broadcast", "📣 Рассылка покупателям"),
     ("tickets", "🆘 Обращения клиентов"),
-    ("recap", "🌅 Рекап: ночь / день / неделя"),
+    ("report", "🌅 Отчёт за ночь"),
     ("backup", "💾 Резервная копия"),
     ("restore", "♻️ Восстановить из копии"),
     ("soldout", "🙈 Закончившиеся товары"),
@@ -4402,7 +4439,7 @@ async def run_scheduled():
         set_setting("last_report", today)
         try:
             await bots["seller"].send_message(
-                ADMIN_ID, recap_text("night"), reply_markup=recap_kb("night")
+                ADMIN_ID, "🌅 <b>Отчёт за ночь</b>\n\n" + stats_text("night"), reply_markup=stats_kb("night")
             )
         except Exception:
             logging.exception("Не удалось отправить отчёт")
@@ -4432,7 +4469,6 @@ async def reserve_watcher():
                     b.as_markup(),
                 )
             for o in expired:
-                fire_and_forget(alarm_cancel(o["id"]))
                 await tell_customer(
                     o["user_id"],
                     f"⏰ Заказ #{o['id']} отменён: оплата не поступила за {RESERVE_MINUTES} мин. "
@@ -4561,38 +4597,13 @@ def acquire_single_instance_lock():
     return sock
 
 
-def db_overview():
-    """Короткая сводка по базе — чтобы сразу видеть, если после обновления данные «откатились»."""
-    with db() as c:
-        n_p = c.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-        n_o = c.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
-        last_o = c.execute("SELECT id, created_at FROM orders ORDER BY id DESC LIMIT 1").fetchone()
-        n_u = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        last_u = c.execute("SELECT full_name, first_seen FROM users ORDER BY first_seen DESC LIMIT 1").fetchone()
-    mtime = datetime.fromtimestamp(os.path.getmtime(DB_PATH), ZoneInfo(TZ)) if os.path.exists(DB_PATH) else None
-    inside = os.path.abspath(DB_PATH).startswith(os.path.abspath(BASE_DIR) + os.sep)
-    out = [
-        "🟢 <b>Бот запущен.</b> Что сейчас в базе:",
-        f"• товаров: {n_p}",
-        f"• заказов: {n_o}" + (f" (последний #{last_o['id']} от {last_o['created_at'][:16]})" if last_o else ""),
-        f"• пользователей: {n_u}" + (f" (последний: {html.escape(last_u['full_name'] or '—')}, {last_u['first_seen'][:16]})" if last_u else ""),
-        f"Файл базы: <code>{html.escape(DB_PATH)}</code>" + (f", изменён {mtime:%d.%m %H:%M}" if mtime else ""),
-        "Если цифры меньше, чем вы ожидали, — база откатилась: восстановите из последней копии (/restore).",
-    ]
-    if inside:
-        out.append(
-            "\n⚠️ База лежит прямо в папке с ботом. Если вы заливаете эту папку целиком (GitHub, архив), "
-            "старый файл shop.db может затереть живую базу. Вынесите её: DB_PATH=/data/shop.db и "
-            "PHOTOS_DIR=/data/photos на постоянном диске хостинга, а shop.db и photos/ не кладите в GitHub."
-        )
-    return "\n".join(out)
-
-
 async def main():
     logging.basicConfig(level=logging.INFO)
     if BOT_TOKEN == SELLER_BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN и SELLER_BOT_TOKEN должны быть токенами РАЗНЫХ ботов.")
     lock = acquire_single_instance_lock()  # noqa: F841 (держим сокет открытым)
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)  # на хостинге: /app/data
+    os.makedirs(PHOTOS_DIR, exist_ok=True)
     init_db()
     logging.info("База данных: %s", DB_PATH)
 
@@ -4618,46 +4629,13 @@ async def main():
     except Exception:
         logging.exception("Не удалось узнать имя бота покупателя")
     await setup_commands()
-    if STARTUP_NOTICE:
-        try:
-            await bots["seller"].send_message(ADMIN_ID, db_overview())
-        except Exception:
-            logging.exception("Не удалось отправить сводку о запуске")
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):  # хостинг шлёт SIGTERM перед заменой контейнера
-        try:
-            loop.add_signal_handler(sig, stop.set)
-        except (NotImplementedError, RuntimeError):
-            pass
-    runner = asyncio.ensure_future(asyncio.gather(
+    await asyncio.gather(
         dp_customer.start_polling(bots["customer"], handle_signals=False),
         dp_seller.start_polling(bots["seller"], handle_signals=False),
         reserve_watcher(),
         restock_watcher(),
         scheduler(),
-    ))
-    stopper = asyncio.ensure_future(stop.wait())
-    await asyncio.wait({runner, stopper}, return_when=asyncio.FIRST_COMPLETED)
-    if runner.done():  # задача упала сама — показываем ошибку
-        stopper.cancel()
-        runner.result()
-        return
-    # пришёл сигнал остановки (обновление/перезапуск на хостинге): пока диск жив — шлём свежую копию базы
-    logging.info("Останавливаюсь…")
-    if BACKUP_ON_STOP:
-        try:
-            await asyncio.wait_for(send_backup(bots["seller"], "💾 Копия перед остановкой бота"), timeout=20)
-        except Exception:
-            logging.exception("Не удалось отправить копию перед остановкой")
-    runner.cancel()
-    try:
-        await runner
-    except BaseException:
-        pass
-    for b in bots.values():
-        if isinstance(b, Bot):
-            await b.session.close()
+    )
 
 
 if __name__ == "__main__":
