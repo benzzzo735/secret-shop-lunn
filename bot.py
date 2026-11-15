@@ -4610,10 +4610,13 @@ def verify_init_data(init_data, max_age=86400):
 
 
 def web_photo(p):
-    """('url'|'file', источник) или None — фото, которое можно отдать в браузер (file_id не подходит)."""
+    """('url'|'file'|'fid', источник) или None. Если файла нет, но у бота есть file_id фото —
+    приложение скачает его через Telegram (так фото в боте и в приложении всегда совпадают)."""
     for kind, src in photo_sources(p):
         if kind == "url" or (kind == "file" and os.path.isfile(src)):
             return kind, src
+    if p["photo_fid"]:
+        return "fid", p["photo_fid"]
     return None
 
 
@@ -4795,7 +4798,20 @@ async def web_photo_handler(request):
         raise web.HTTPNotFound()
     if ph[0] == "url":
         raise web.HTTPFound(ph[1])
-    return web.FileResponse(ph[1], headers={"Cache-Control": "public, max-age=3600"})
+    path = ph[1]
+    if ph[0] == "fid":  # скачиваем через бота покупателя и кладём в кэш на диск (имя зависит от file_id)
+        cache = os.path.join(PHOTOS_DIR, "_web")
+        os.makedirs(cache, exist_ok=True)
+        path = os.path.join(cache, f"{pid}_{zlib.crc32(ph[1].encode()):08x}.jpg")
+        if not os.path.isfile(path):
+            try:
+                buf = await bots["customer"].download(ph[1])
+                with open(path, "wb") as f:
+                    f.write(buf.read())
+            except Exception:
+                logging.warning("Mini App: не удалось скачать фото товара %s", pid)
+                raise web.HTTPNotFound()
+    return web.FileResponse(path, headers={"Cache-Control": "public, max-age=3600"})
 
 
 @customer_router.message(Command("app", "shop"))
