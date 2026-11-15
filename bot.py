@@ -3359,7 +3359,7 @@ async def s_backup(m: Message):
         await m.answer(f"⚠️ {html.escape(str(e))}")
 
 
-@seller_router.message(Command("restore"))
+@seller_router.message(Command("restore"), ~F.document)  # файл с подписью /restore обрабатывает s_import_file
 async def s_restore_help(m: Message):
     await m.answer(
         "♻️ Восстановление из копии: отправьте боту файл копии (.zip из /backup или .db) "
